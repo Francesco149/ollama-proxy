@@ -19,8 +19,8 @@ The goal is to move from a single file to a modular service where `proxy.py` act
 
 ## Implementation Phases
 1. **Phase 1: Extraction.** Move vision and tool logic into standalone modules. (COMPLETED)
-2. **Phase 2: Skill Engine.** Implement the `SkillEngine` with a dedicated trigger-detection middleware.
-3. **Phase 3: Session Refactor.** Transition skill state management to the `SessionManager`.
+2. **Phase 2: Skill Engine.** Implement the `SkillEngine` with a dedicated trigger-detection middleware. (COMPLETED)
+3. **Phase 3: Session Refactor.** Transition skill state management to the `SessionManager`. (COMPLETED)
 4. **Phase 4: Cleanup.** Strip `proxy.py` down to a clean router.
 
 ## Constraints
