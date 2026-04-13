@@ -11,6 +11,7 @@ from skill_engine import SkillEngine
 
 LLAMA_BASE = "http://localhost:8080"
 INGEST_BASE = "http://localhost:8083"
+EMBEDDING_BASE = "http://localhost:6080"
 MODEL_NAME = "gemma4"
 REAL_MODEL = None
 
@@ -76,6 +77,28 @@ async def ps():
         "expires_at": "2099-01-01T00:00:00Z",
         "details": {"families": ["gemma", "clip"]},
     }]}
+
+# ── embeddings ────────────────────────────────────────────────────────────────
+
+@app.post("/api/embeddings")
+async def embeddings(request: Request):
+    log.info(f"[proxy] embedding request received")
+    body = await request.body()
+    headers = dict(request.headers)
+    
+    # Remove host header to avoid conflicts with the downstream service
+    headers.pop("host", None)
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{EMBEDDING_BASE}/embedding",
+            content=body,
+            headers=headers
+        )
+        return JSONResponse(
+            content=resp.json(),
+            status_code=resp.status_code
+        )
 
 # ── chat ──────────────────────────────────────────────────────────────────────
 
