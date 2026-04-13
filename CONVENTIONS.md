@@ -18,6 +18,17 @@
 - **Error Handling:** Do not swallow errors. Use structured error handling and ensure errors are caught at the appropriate architectural boundary.
 - **Self-Documenting Code:** Variable and function names must be descriptive and unambiguous. Use comments only for "why," not "what."
 
+## Observability & Logging
+- **Proactive Instrumentation:** Every core module must implement structured logging from the start. Do not treat logging as a debugging tool to be added after a failure; treat it as a primary architectural requirement.
+- **Structured & Formatted Logs:** Use the standard `logging` library. Logs must be well-formatted (e.g., `TIMESTAMP [LEVEL] [MODULE] MESSAGE`) and easy to consume for both humans and automated tools.
+- **Correct Level Usage:**
+    - `DEBUG`: Verbose data dumps (e.g., raw API JSON payloads, full metadata objects).
+    - `INFO`: Key lifecycle milestones (e.g., "Module initialized", "Task completed").
+    - `WARNING`: Non-fatal anomalies or unexpected but recoverable states.
+    - `ERROR`: Critical failures that halt a specific task or module.
+- **Contextual Metadata:** Every log entry must include the module name (e.g., `[ingest.parser]`) to ensure we aren't scrambling to find the source of a failure.
+- **No Print Statements:** Never use `print()`. Always use the configured `logging` instance.
+
 ## Tooling & Environment
 - **Standard Libraries:** Prefer well-maintained, industry-standard libraries over custom-built solutions unless there is a clear performance or architectural reason.
 - **Automated Testing:** Every core logic component must have corresponding unit tests. Aim for high coverage on business logic, not just boilerplate.
