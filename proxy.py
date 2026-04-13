@@ -105,8 +105,20 @@ async def embeddings(request: Request):
             content=content,
             headers=headers
         )
+        data = resp.json()
+        
+        # Reformat response for Open-WebUI compatibility
+        # Downstream returns: [{"embedding": [...]}, ...]
+        # Open-WebUI expects: {"embeddings": [[...], ...]}
+        if isinstance(data, list):
+            new_data = {"embeddings": [item["embedding"] for item in data if "embedding" in item]}
+            return JSONResponse(
+                content=new_data,
+                status_code=resp.status_code
+            )
+            
         return JSONResponse(
-            content=resp.json(),
+            content=data,
             status_code=resp.status_code
         )
 
