@@ -80,7 +80,7 @@ async def ps():
 
 # ── embeddings ────────────────────────────────────────────────────────────────
 
-@app.post("/api/embeddings")
+@app.post("/api/embed")
 async def embeddings(request: Request):
     log.info(f"[proxy] embedding request received")
     body_json = await request.json()
