@@ -83,16 +83,22 @@ async def ps():
 @app.post("/api/embeddings")
 async def embeddings(request: Request):
     log.info(f"[proxy] embedding request received")
-    body = await request.body()
+    body_json = await request.json()
     headers = dict(request.headers)
     
     # Remove host header to avoid conflicts with the downstream service
     headers.pop("host", None)
 
+    # Protocol translation: Ollama "prompt" -> OpenAI "input"
+    if "prompt" in body_json:
+        body_json["input"] = body_json.pop("prompt")
+    
+    content = json.dumps(body_json)
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{EMBEDDING_BASE}/embedding",
-            content=body,
+            content=content,
             headers=headers
         )
         return JSONResponse(
