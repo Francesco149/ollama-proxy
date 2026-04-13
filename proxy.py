@@ -95,6 +95,10 @@ async def embeddings(request: Request):
     
     content = json.dumps(body_json)
 
+    # Remove Content-Length to allow httpx to recalculate it for the new body size
+    headers.pop("content-length", None)
+    headers.pop("Content-Length", None)
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{EMBEDDING_BASE}/embedding",
