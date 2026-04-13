@@ -9,7 +9,7 @@
 The goal is to move from a single file to a modular service where `proxy.py` acts only as a thin routing layer.
 
 ### Module Breakdown
-- `proxy.py`: Main entry point. Handles basic Ollama API routing, version checks, and protocol translation for embeddings (both request translation and response reformatting).
+- `proxy.py`: Main entry point. Handles basic Ollama API routing, version checks, and protocol translation for embeddings (both request translation and response reformatting, including a flattening step for `llama.cpp` compatibility).
 - `skill_engine.py`: 
     - **Intent Detection:** Middleware that scans prompts for skill triggers.
     - **Lifecycle Management:** Manages skill activation and session persistence.

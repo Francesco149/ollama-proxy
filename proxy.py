@@ -110,8 +110,9 @@ async def embeddings(request: Request):
         # Reformat response for Open-WebUI compatibility
         # Downstream returns: [{"embedding": [...]}, ...]
         # Open-WebUI expects: {"embeddings": [[...], ...]}
+        # Note: llama.cpp may return a nested list, so we flatten it if necessary.
         if isinstance(data, list):
-            new_data = {"embeddings": [item["embedding"] for item in data if "embedding" in item]}
+            new_data = {"embeddings": [item["embedding"] if isinstance(item["embedding"][0], float) else item["embedding"][0] for item in data if "embedding" in item]}
             return JSONResponse(
                 content=new_data,
                 status_code=resp.status_code
