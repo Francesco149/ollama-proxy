@@ -8,6 +8,9 @@ import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+from vision_module import to_openai_messages
+from tool_manager import TOOLS, execute_tool
+
 LLAMA_BASE = "http://localhost:8080"
 INGEST_BASE = "http://localhost:8083"
 MODEL_NAME = "gemma4"
@@ -19,8 +22,6 @@ REAL_MODEL = None
 app = FastAPI()
 active_skills: dict[str, set[str]] = {}
 
-_ingest_sem = asyncio.Semaphore(2)  # max 2 concurrent
-
 import logging
 logging.basicConfig(
     level=logging.INFO,
@@ -28,34 +29,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("ingest")
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "ingest_url",
-            "description": (
-                "Save one or more URLs to the knowledge base. Use when the user shares links and asks to "
-                "remember, save, archive, or learn from them. Works with YouTube videos, articles, and web pages."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "urls": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of URLs to ingest"
-                    },
-                    "note": {
-                        "type": "string",
-                        "description": "Optional note about why these are being saved"
-                    }
-                },
-                "required": ["urls"]
-            }
-        }
-    }
-]
 
 # ── startup ───────────────────────────────────────────────────────────────────
 
@@ -186,73 +159,6 @@ def inject_skills(messages: list) -> list:
             return messages
     messages.insert(0, {"role": "system", "content": injection})
     return messages
-
-# ── tool execution ────────────────────────────────────────────────────────────
-
-async def execute_tool(name: str, args: dict) -> str:
-    log.info(f"[tool] execute name={name} args={args}")
-    if name == "ingest_url":
-        urls = args.get("urls", [])
-
-        if isinstance(urls, str):
-            urls = [urls]
-
-        # also check for singular "url" key — model sometimes ignores schema
-        if not urls and args.get("url"):
-            urls = [args["url"]]
-
-        log.info(f"[tool] urls to ingest: {urls}")
-        if not urls:
-            return "No URLs found in tool call args"
-
-        note = args.get("note", "")
-
-        async def ingest_one(url: str) -> str:
-            try:
-                log.info(f"[tool] ingesting {url}")
-                async with _ingest_sem:
-                    async with httpx.AsyncClient(timeout=600) as client:
-                        log.info(f"[tool] ingest_url {url}")
-                        resp = await client.post(f"{INGEST_BASE}/ingest", json={"url": url, "note": note})
-                        r = resp.json()
-                    if r.get("status") == "ok":
-                        return f"✓ {r.get('title') or r.get('domain') or url}"
-                    elif r.get("status") == "todo":
-                        return f"⚠ unsupported URL saved as todo: {url}"
-                    else:
-                        return f"✗ failed: {url} — {r.get('error')}"
-            except Exception as e:
-                log.error(f"[tool] ingest_one exception for {url}: {e}", exc_info=True)
-                return f"✗ exception: {url} — {e}"
-
-        try:
-            results = await asyncio.gather(*[ingest_one(url) for url in urls])
-            return "Saved to knowledge base:\n" + "\n".join(results)
-        except Exception as e:
-            log.error(f"[tool] gather exception: {e}", exc_info=True)
-            return f"Error during ingestion: {e}"
-
-    return f"Unknown tool: {name}"
-
-# ── format conversion ─────────────────────────────────────────────────────────
-
-def to_openai_messages(messages: list, images: list = None) -> list:
-    result = []
-    for i, msg in enumerate(messages):
-        content = msg.get("content", "")
-        msg_images = list(msg.get("images", []))
-        if images and i == len(messages)-1 and msg["role"] == "user":
-            msg_images += images
-        if msg_images:
-            parts = [{"type": "text", "text": content}]
-            for img in msg_images:
-                if not img.startswith("data:"):
-                    img = f"data:image/jpeg;base64,{img}"
-                parts.append({"type": "image_url", "image_url": {"url": img}})
-            result.append({"role": msg["role"], "content": parts})
-        else:
-            result.append({"role": msg["role"], "content": content})
-    return result
 
 # ── chat ──────────────────────────────────────────────────────────────────────
 
