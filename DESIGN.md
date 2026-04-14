@@ -40,15 +40,15 @@ The proxy acts as an interceptor between the LLM (llama.cpp) and the local execu
 
 ## 3. Registration Handshake (Service Discovery)
 
-The system utilizes a dynamic registration pattern to connect external shell environments to the proxy.
+The system utilizes an HTTP-based registration pattern to connect external shell environments to the proxy.
 
-### 3.1 UDP Discovery Protocol
-- **Mechanism:** The `shell_server` (or external agent) broadcasts its presence via a UDP discovery packet on a predefined port.
+### 3.1 HTTP Registration
+- **Mechanism:** The `shell_server` (or external agent) performs an HTTP POST request to the `/register_shell` endpoint on the proxy.
 - **Handshake:**
-    1. **Discovery:** The `tool_manager` listens for incoming UDP broadcast packets.
-    2. **Registration:** Upon receiving a valid packet, the `tool_manager` extracts the service URL.
+    1. **Discovery:** The `shell_server` uses a UDP socket locally to discover its own IP address.
+    2. **Registration:** Upon receiving the HTTP POST request, the proxy extracts the service URL from the request body.
     3. **Binding:** The URL is stored in the global `shell_url` state via `set_shell_url()`.
-- **Purpose:** This allows the proxy to dynamically know where to route `register_shell` requests and manual command executions without hardcoded configuration changes.
+- **Purpose:** This allows the proxy to dynamically know where to route manual command executions without hardcoded configuration changes.
 
 ---
 
@@ -59,4 +59,4 @@ The system utilizes a dynamic registration pattern to connect external shell env
 | **SessionManager** | State Authority | Deterministic Hashing & Set Union |
 | **SkillEngine** | Context Injection | Trigger-Coverage Scoring |
 | **Proxy Streamer** | Protocol Translation | Buffer-and-Trigger Interception |
-| **ToolManager** | Command Execution | UDP-based Registration Handshake |
+| **ToolManager** | Command Execution | HTTP-based Registration |
