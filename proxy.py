@@ -156,7 +156,7 @@ async def chat(request: Request):
     # ─── STRICT USER-ONLY COMMAND INTERCEPTOR ──────────────────────────────────
     if len(messages) > 0 and messages[-1].get("role") == "user":
         user_input = messages[-1].get("content", "").strip()
-        if user_input.startswith(".run"):
+        if user_input.startswith("."):
             result = await process_manual_command(messages)
             if result:
                 return JSONResponse(content={"message": {"role": "assistant", "content": result}})
