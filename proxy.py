@@ -3,7 +3,6 @@ import json
 import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-import re
 
 from vision_module import to_openai_messages
 from tool_manager import TOOLS, execute_tool, set_shell_url, process_manual_command
@@ -138,9 +137,6 @@ async def embeddings(request: Request):
         )
 
 # ── chat ──────────────────────────────────────────────────────────────────────
-
-# Matches: ````` <command> `````
-SHELL_EXTRACT_PATTERN = re.compile(r'`````\s*(.*?)\s*`````', re.DOTALL)
 
 @app.post("/api/chat")
 async def chat(request: Request):
