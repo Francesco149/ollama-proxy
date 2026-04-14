@@ -2,12 +2,16 @@ import httpx
 import asyncio
 import logging
 import re
+from config_loader import get_config
 
 log = logging.getLogger("tool")
 
 SHELL_SERVER_URL = None
 
-INGEST_BASE = "http://localhost:8083"
+config = get_config()
+server_cfg = config.get("server", {})
+INGEST_BASE = server_cfg.get("ingest_base", "http://localhost:8083")
+
 _ingest_sem = asyncio.Semaphore(2)  # max 2 concurrent
 
 SHELL_EXTRACT_PATTERN = re.compile(r'`````\s*(.*?)\s*`````', re.DOTALL)
