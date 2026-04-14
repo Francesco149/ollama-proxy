@@ -24,7 +24,7 @@ class SessionManager:
         if session_id not in self.active_skills_sessions:
             self.active_skills_sessions[session_id] = set()
         
-        self.active_skills_sessions[session_id] = new_skills
+        self.active_skills_sessions[session_id].update(new_skills)
 
     def clear_session(self, session_id: str):
         if session_id in self.active_skills_sessions:
