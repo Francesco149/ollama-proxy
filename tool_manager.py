@@ -39,23 +39,6 @@ TOOLS = [
                 "required": ["urls"]
             }
         }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_shell",
-            "description": "Run a shell command on the remote tool server. Use this to explore the filesystem, read files, or run build commands.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute"
-                    }
-                },
-                "required": ["command"]
-            }
-        }
     }
 ]
 
