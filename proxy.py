@@ -8,6 +8,7 @@ from vision_module import to_openai_messages
 from tool_manager import TOOLS, execute_tool, set_shell_url
 from session_manager import SessionManager
 from skill_engine import SkillEngine
+from stream_handler import handle_non_streaming_chat, generate_streaming_chat
 
 LLAMA_BASE = "http://localhost:8080"
 INGEST_BASE = "http://localhost:8083"
@@ -162,96 +163,13 @@ async def chat(request: Request):
 
     # non-streaming: simple tool loop
     if not stream:
-        async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(f"{LLAMA_BASE}/v1/chat/completions", json=openai_body)
-            data = resp.json()
-        msg = data["choices"][0]["message"]
-        if msg.get("tool_calls"):
-            tool_results = []
-            for tc in msg["tool_calls"]:
-                args = json.loads(tc["function"]["arguments"])
-                result = await execute_tool(tc["function"]["name"], args)
-                tool_results.append(result)
-            return JSONResponse({
-                "model": MODEL_NAME,
-                "message": {"role": "assistant", "content": "\n".join(tool_results)},
-                "done": True,
-            })
-        return JSONResponse({
-            "model": MODEL_NAME,
-            "message": {"role": "assistant", "content": msg.get("content", "")},
-            "done": True,
-        })
+        return await handle_non_streaming_chat(openai_body, MODEL_NAME, LLAMA_BASE)
 
     # streaming: buffer until tool_call complete, then execute and stream result
-    async def generate():
-        tool_call_buffer = ""
-        tool_name = None
-        in_tool_call = False
-
-        async with httpx.AsyncClient(timeout=300) as client:
-            async with client.stream(
-                "POST", f"{LLAMA_BASE}/v1/chat/completions", json=openai_body
-            ) as resp:
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk["choices"][0]["delta"]
-                        finish = chunk["choices"][0].get("finish_reason")
-
-                        # tool call detection
-                        if delta.get("tool_calls"):
-                            in_tool_call = True
-                            tc = delta["tool_calls"][0]
-                            if tc.get("function", {}).get("name"):
-                                tool_name = tc["function"]["name"]
-                            tool_call_buffer += tc.get("function", {}).get("arguments", "")
-                            continue
-
-                        if finish == "tool_calls" or (in_tool_call and finish == "stop"):
-                            log.info(f"[tool] tool_name={tool_name} buffer={tool_call_buffer!r}")
-                            # execute tool
-                            try:
-                                args = json.loads(tool_call_buffer)
-                            except Exception as e:
-                                log.info(f"[tool] json parse failed: {e}")
-                                args = {}
-                            yield json.dumps({
-                                "model": MODEL_NAME,
-                                "message": {"role": "assistant", "content": "⏳ Processing..."},
-                                "done": False,
-                            }) + "\n"
-                            result = await execute_tool(tool_name or "", args)
-                            yield json.dumps({
-                                "model": MODEL_NAME,
-                                "message": {"role": "assistant", "content": result},
-                                "done": False,
-                            }) + "\n"
-                            break
-
-                        content = delta.get("content", "")
-                        if content:
-                            yield json.dumps({
-                                "model": MODEL_NAME,
-                                "message": {"role": "assistant", "content": content},
-                                "done": False,
-                            }) + "\n"
-
-                    except Exception:
-                        continue
-
-        yield json.dumps({
-            "model": MODEL_NAME,
-            "message": {"role": "assistant", "content": ""},
-            "done": True,
-        }) + "\n"
-
-    return StreamingResponse(generate(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        generate_streaming_chat(openai_body, MODEL_NAME, LLAMA_BASE, log), 
+        media_type="application/x-ndjson"
+    )
 
 if __name__ == "__main__":
     import uvicorn
