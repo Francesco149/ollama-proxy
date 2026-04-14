@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from vision_module import to_openai_messages
-from tool_manager import TOOLS, execute_tool
+from tool_manager import TOOLS, execute_tool, set_shell_url
 from session_manager import SessionManager
 from skill_engine import SkillEngine
 
@@ -77,6 +77,18 @@ async def ps():
         "expires_at": "2099-01-01T00:00:00Z",
         "details": {"families": ["gemma", "clip"]},
     }]}
+
+# ── shell registration ───────────────────────────────────────────────────────
+
+@app.post("/register_shell")
+async def register_shell(request: Request):
+    body = await request.json()
+    url = body.get("url")
+    if not url:
+        return JSONResponse(content={"error": "url is required"}, status_code=400)
+    set_shell_url(url)
+    log.info(f"[proxy] shell URL registered: {url}")
+    return {"status": "ok"}
 
 # ── embeddings ────────────────────────────────────────────────────────────────
 
