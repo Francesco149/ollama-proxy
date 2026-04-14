@@ -2,13 +2,8 @@ import os
 import glob
 import re
 import logging
-import tomllib
 from session_manager import SessionManager
-
-try:
-    import tomli as tomllib
-except ImportError:
-    pass
+from config_loader import get_config
 
 log = logging.getLogger("skill-engine")
 
@@ -17,25 +12,15 @@ class SkillEngine:
         self.session_manager = session_manager
         self.skills = {}
         self.triggers = {}
-        self._load_config()
         self._load_skills()
 
-    def _load_config(self):
-        config_path = os.environ.get("OLLAMA_PROXY_CONFIG", "/opt/ai-lab/ollama-proxy/config.toml")
-        if os.path.exists(config_path):
-            with open(config_path, "rb") as f:
-                config = tomllib.load(f)
-                skills_cfg = config.get("skills", {})
-                self.skills_dir = skills_cfg.get("dir", "/opt/ai-lab/skills")
-                self.max_skills = skills_cfg.get("max_skills", 2)
-                self.min_score = skills_cfg.get("min_score", 0.15)
-        else:
-            log.warning(f"[skill-engine] {config_path} not found, using defaults")
-            self.skills_dir = "/opt/ai-lab/skills"
-            self.max_skills = 2
-            self.min_score = 0.15
-
     def _load_skills(self):
+        config = get_config()
+        skills_cfg = config.get("skills", {})
+        self.skills_dir = skills_cfg.get("dir", "/opt/ai-lab/skills")
+        self.max_skills = skills_cfg.get("max_skills", 2)
+        self.min_score = skills_cfg.get("min_score", 0.15)
+
         self.skills = {}
         self.triggers = {}
         for path in glob.glob(os.path.join(self.skills_dir, "*.md")):
@@ -58,7 +43,6 @@ class SkillEngine:
 
     def process_message(self, messages: list) -> list:
         # Ensure live reloading of skills and config
-        self._load_config()
         self._load_skills()
         
         # Extract last user message for scoring
