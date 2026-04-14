@@ -45,10 +45,13 @@ Trace of a single user message from Open-WebUI:
 
 ## 4. System Environment
 
+### Configuration
+- **`config.toml`**: Contains the following service URLs:
+    - `LLAMA_BASE`: URL of the LLM engine (e.g., `http://localhost:8080`).
+    - `INGEST_BASE`: URL of the knowledge base ingestion service.
+    - `EMBEDDING_BASE`: URL of the embedding service.
+
 ### Required Environment Variables
-- `LLAMA_BASE`: URL of the LLM engine (e.g., `http://localhost:8080`).
-- `INGEST_BASE`: URL of the knowledge base ingestion service.
-- `EMBEDDING_BASE`: URL of the embedding service.
 - `PROXY_URL`: The public/reachable URL of the proxy (used by `shell_server` for registration).
 
 ### Port Mapping
