@@ -1,0 +1,10 @@
+[skills]
+dir = "/opt/ai-lab/skills"
+max_skills = 2
+min_score = 0.15
+
+[server]
+llama_base = "http://localhost:8080"
+ingest_base = "http://localhost:8083"
+proxy_port = 11434
+shell_server_port = 8000
