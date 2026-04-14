@@ -1,6 +1,8 @@
 import httpx
 import json
 import asyncio
+import os
+import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -10,17 +12,31 @@ from session_manager import SessionManager
 from skill_engine import SkillEngine
 from stream_handler import handle_non_streaming_chat, generate_streaming_chat
 
-LLAMA_BASE = "http://localhost:8080"
-INGEST_BASE = "http://localhost:8083"
-EMBEDDING_BASE = "http://localhost:6080"
-MODEL_NAME = "gemma4"
+try:
+    import tomli as tomllib
+except ImportError:
+    import tomllib
+
+# Load configuration
+CONFIG_PATH = os.environ.get("OLLAMA_PROXY_CONFIG", "/opt/ai-lab/ollama-proxy/config.toml")
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH, "rb") as f:
+        config = tomllib.load(f)
+else:
+    config = {}
+
+server_cfg = config.get("server", {})
+LLAMA_BASE = server_cfg.get("llama_base", "http://localhost:8080")
+INGEST_BASE = server_cfg.get("ingest_base", "http://localhost:8083")
+EMBEDDING_BASE = server_cfg.get("embedding_base", "http://localhost:6080")
+MODEL_NAME = server_cfg.get("model_name", "gemma4")
+
 REAL_MODEL = None
 
 app = FastAPI()
 session_manager = SessionManager()
 skill_engine = SkillEngine(session_manager)
 
-import logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(message)s",
