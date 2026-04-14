@@ -4,8 +4,15 @@ import logging
 
 log = logging.getLogger("tool")
 
+SHELL_SERVER_URL = None
+
 INGEST_BASE = "http://localhost:8083"
 _ingest_sem = asyncio.Semaphore(2)  # max 2 concurrent
+
+def set_shell_url(url: str):
+    global SHELL_SERVER_URL
+    SHELL_SERVER_URL = url
+    log.info(f"[tool] SHELL_SERVER_URL set to {url}")
 
 TOOLS = [
     {
@@ -30,6 +37,23 @@ TOOLS = [
                     }
                 },
                 "required": ["urls"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": "Run a shell command on the remote tool server. Use this to explore the filesystem, read files, or run build commands.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    }
+                },
+                "required": ["command"]
             }
         }
     }
@@ -77,5 +101,33 @@ async def execute_tool(name: str, args: dict) -> str:
         except Exception as e:
             log.error(f"[tool] gather exception: {e}", exc_info=True)
             return f"Error during ingestion: {e}"
+
+    if name == "run_shell":
+        command = args.get("command")
+        if not command:
+            return "No command provided for run_shell"
+        
+        if not SHELL_SERVER_URL:
+            return "Shell server URL is not configured"
+
+        try:
+            log.info(f"[tool] running shell command: {command}")
+            async with httpx.AsyncClient(timeout=600) as client:
+                resp = await client.post(f"{SHELL_SERVER_URL}/exec", json={"command": command})
+                r = resp.json()
+            
+            stdout = r.get("stdout", "")
+            stderr = r.get("stderr", "")
+            exit_code = r.get("exit_code", 0)
+
+            result = f"Command executed (exit code: {exit_code})\n"
+            if stdout:
+                result += f"STDOUT:\n{stdout}\n"
+            if stderr:
+                result += f"STDERR:\n{stderr}\n"
+            return result
+        except Exception as e:
+            log.error(f"[tool] run_shell exception: {e}", exc_info=True)
+            return f"Error executing shell command: {e}"
 
     return f"Unknown tool: {name}"

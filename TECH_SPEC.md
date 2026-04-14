@@ -14,7 +14,7 @@ The goal is to move from a single file to a modular service where `proxy.py` act
     - **Intent Detection:** Middleware that scans prompts for skill triggers.
     - **Lifecycle Management:** Manages skill activation and session persistence.
 - `vision_module.py`: Translates Ollama image formats to OpenAI multipart requests.
-- `tool_manager.py`: Intercepts tool calls and manages local execution.
+- `tool_manager.py`: Intercepts tool calls and manages local execution. Includes `ingest_url` for knowledge base management and `run_shell` for remote command execution.
 - `session_manager.py`: Handles session persistence and active skill state across the conversation.
 
 ## Implementation Phases
