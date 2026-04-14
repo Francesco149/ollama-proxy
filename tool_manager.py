@@ -49,6 +49,31 @@ TOOLS = [
     }
 ]
 
+async def _handle_run(messages: list) -> str:
+    # Iterate backwards to find the most recent assistant message
+    assistant_msg = None
+    for msg in reversed(messages[:-1]):
+        if msg.get("role") == "assistant":
+            assistant_msg = msg
+            break
+    
+    if not assistant_msg:
+        return "No assistant message found to extract commands from."
+    
+    matches = SHELL_EXTRACT_PATTERN.findall(assistant_msg.get("content", ""))
+    if not matches:
+        return "No shell commands found in the last assistant message."
+    
+    results = []
+    for cmd in matches:
+        res = await execute_tool("run_shell", {"command": cmd.strip()})
+        results.append(res)
+    
+    return "\n\n---\n\n".join(results)
+
+async def _handle_diff(_messages: list) -> str:
+    return await execute_tool("run_shell", {"command": "git diff HEAD~1 HEAD"})
+
 async def process_manual_command(messages: list) -> str | None:
     if not messages:
         return None
@@ -59,33 +84,33 @@ async def process_manual_command(messages: list) -> str | None:
     
     content = last_msg.get("content", "").strip()
     
-    if content == ".run":
-        # Iterate backwards to find the most recent assistant message
-        assistant_msg = None
-        for msg in reversed(messages[:-1]):
-            if msg.get("role") == "assistant":
-                assistant_msg = msg
-                break
-        
-        if not assistant_msg:
-            return "No assistant message found to extract commands from."
-        
-        matches = SHELL_EXTRACT_PATTERN.findall(assistant_msg.get("content", ""))
-        if not matches:
-            return "No shell commands found in the last assistant message."
-        
-        results = []
-        for cmd in matches:
-            res = await execute_tool("run_shell", {"command": cmd.strip()})
-            results.append(res)
-        
-        return "\n\n---\n\n".join(results)
+    # Dispatcher mapping
+    handlers = {
+        ".run": _handle_run,
+        ".diff": _handle_diff,
+    }
 
-    if content.startswith(".run "):
-        cmd = content[5:].strip()
-        if not cmd:
-            return "No command provided after .run"
-        return await execute_tool("run_shell", {"command": cmd})
+    # Check for exact matches (e.g., ".run" or ".diff")
+    if content in handlers:
+        return await handlers[content](messages)
+
+    # Check for prefixed matches (e.g., ".run <command>")
+    for prefix, handler in handlers.items():
+        if content.startswith(prefix + " "):
+            # Note: .diff doesn't currently take arguments in this implementation, 
+            # but we check for prefix consistency.
+            if prefix == ".run":
+                cmd = content[len(prefix)+1:].strip()
+                if not cmd:
+                    return f"No command provided after {prefix}"
+                return await execute_tool("run_shell", {"command": cmd})
+            else:
+                # For commands like .diff that don't take args, we just call the handler
+                return await handler(messages)
+
+    # If it starts with a dot but isn't in our dispatcher
+    if content.startswith("."):
+        return f"❌ Error: Unknown command '{content.split()[0]}'"
 
     return None
 
