@@ -26,7 +26,7 @@ class SkillEngine:
             with open(config_path, "rb") as f:
                 config = tomllib.load(f)
                 skills_cfg = config.get("skills", {})
-                self.skills_dir = skills_cfg.get("directory", "/opt/ai-lab/skills")
+                self.skills_dir = skills_cfg.get("dir", "/opt/ai-lab/skills")
                 self.max_skills = skills_cfg.get("max_skills", 2)
                 self.min_score = skills_cfg.get("min_score", 0.15)
         else:
@@ -58,6 +58,7 @@ class SkillEngine:
 
     def process_message(self, messages: list) -> list:
         # Ensure live reloading of skills and config
+        self._load_config()
         self._load_skills()
         
         # Extract last user message for scoring
