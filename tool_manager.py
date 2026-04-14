@@ -120,11 +120,11 @@ async def execute_tool(name: str, args: dict) -> str:
             stderr = r.get("stderr", "")
             exit_code = r.get("exit_code", 0)
 
-            result = f"Command executed (exit code: {exit_code})\n"
+            result = f"Command executed (exit code: `{exit_code}`)\n"
             if stdout:
-                result += f"STDOUT:\n{stdout}\n"
+                result += f"### STDOUT:\n`````\n{stdout}\n`````\n"
             if stderr:
-                result += f"STDERR:\n{stderr}\n"
+                result += f"### STDERR:\n`````\n{stderr}\n`````\n"
             return result
         except Exception as e:
             log.error(f"[tool] run_shell exception: {e}", exc_info=True)
