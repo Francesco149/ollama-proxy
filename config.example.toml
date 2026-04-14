@@ -6,5 +6,7 @@ min_score = 0.15
 [server]
 llama_base = "http://localhost:8080"
 ingest_base = "http://localhost:8083"
+embedding_base = "http://localhost:6080"
+model_name = "gemma4"
 proxy_port = 11434
 shell_server_port = 8000
