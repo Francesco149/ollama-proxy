@@ -28,6 +28,7 @@ class SkillEngine:
                 skills_cfg = config.get("skills", {})
                 self.skills_dir = skills_cfg.get("dir", "/opt/ai-lab/skills")
                 self.max_skills = skills_cfg.get("max_skills", 2)
+                self.min_score = skills_cfg.get("min_score", 0.15)
         else:
             log.warning(f"[skill-engine] {config_path} not found, using defaults")
             self.skills_dir = "/opt/ai-lab/skills"
