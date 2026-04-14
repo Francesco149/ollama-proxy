@@ -11,19 +11,10 @@ from tool_manager import TOOLS, execute_tool, set_shell_url, process_manual_comm
 from session_manager import SessionManager
 from skill_engine import SkillEngine
 from stream_handler import handle_non_streaming_chat, generate_streaming_chat
-
-try:
-    import tomli as tomllib
-except ImportError:
-    import tomllib
+from config_loader import get_config
 
 # Load configuration
-CONFIG_PATH = os.environ.get("OLLAMA_PROXY_CONFIG", "/opt/ai-lab/ollama-proxy/config.toml")
-if os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH, "rb") as f:
-        config = tomllib.load(f)
-else:
-    config = {}
+config = get_config()
 
 server_cfg = config.get("server", {})
 LLAMA_BASE = server_cfg.get("llama_base", "http://localhost:8080")
