@@ -2,25 +2,43 @@ import os
 import glob
 import re
 import logging
+import tomllib
 from session_manager import SessionManager
 
-log = logging.getLogger("skill-engine")
+try:
+    import tomli as tomllib
+except ImportError:
+    pass
 
-SKILLS_DIR = "/opt/ai-lab/skills"
-MAX_SKILLS = 2
-MIN_SCORE = 0.15
+log = logging.getLogger("skill-engine")
 
 class SkillEngine:
     def __init__(self, session_manager: SessionManager):
         self.session_manager = session_manager
         self.skills = {}
         self.triggers = {}
+        self._load_config()
         self._load_skills()
+
+    def _load_config(self):
+        config_path = "config.toml"
+        if os.path.exists(config_path):
+            with open(config_path, "rb") as f:
+                config = tomllib.load(f)
+                skills_cfg = config.get("skills", {})
+                self.skills_dir = skills_cfg.get("directory", "/opt/ai-lab/skills")
+                self.max_skills = skills_cfg.get("max_skills", 2)
+                self.min_score = skills_cfg.get("min_score", 0.15)
+        else:
+            log.warning(f"[skill-engine] {config_path} not found, using defaults")
+            self.skills_dir = "/opt/ai-lab/skills"
+            self.max_skills = 2
+            self.min_score = 0.15
 
     def _load_skills(self):
         self.skills = {}
         self.triggers = {}
-        for path in glob.glob(os.path.join(SKILLS_DIR, "*.md")):
+        for path in glob.glob(os.path.join(self.skills_dir, "*.md")):
             name = os.path.basename(path).replace(".md", "")
             with open(path) as f:
                 content = f.read()
@@ -39,6 +57,9 @@ class SkillEngine:
         return len(overlap) / max(len(trigger_words), 1)
 
     def process_message(self, messages: list) -> list:
+        # Ensure live reloading of skills and config
+        self._load_skills()
+        
         # Extract last user message for scoring
         last_user = None
         for m in reversed(messages):
@@ -60,7 +81,7 @@ class SkillEngine:
         log.info(f"[skill-engine] session={session_id} scores={scores}")
 
         # Determine newly activated skills
-        newly = {n for n, s in scores.items() if s >= MIN_SCORE}
+        newly = {n for n, s in scores.items() if s >= self.min_score}
         
         current_active = self.session_manager.get_active_skills(session_id)
         
@@ -69,9 +90,9 @@ class SkillEngine:
         
         # Update state
         combined_active = current_active | newly
-        if len(combined_active) > MAX_SKILLS:
+        if len(combined_active) > self.max_skills:
             top = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-            combined_active = {n for n, _ in top[:MAX_SKILLS]}
+            combined_active = {n for n, _ in top[:self.max_skills]}
         
         self.session_manager.update_skills(session_id, combined_active)
         log.info(f"[skill-engine] active: {combined_active}")
