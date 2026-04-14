@@ -1,37 +1,70 @@
-# TECH_SPEC.md: ollama-proxy Refactor
+# TECH_SPEC.md: System Structural Specification
 
-## Current State
-- **Monolith:** `proxy.py` handles routing, vision translation, skill injection, and tool execution.
-- **Skill Logic:** Hardcoded or "vibe-coded" injection logic that lacks clear separation from the main request flow.
-- **Scalability:** Low. Adding new skills or tools requires modifying the core proxy logic.
+## 1. Module Responsibility Map
 
-## Target Architecture (Modular)
-The goal is to move from a single file to a modular service where `proxy.py` acts only as a thin routing layer.
+| Module | Responsibility |
+| :--- | :--- |
+| `proxy.py` | **Thin Router:** Entry point. Handles Ollama API routing, version stubs, embedding protocol translation, and the `/register_shell` endpoint. |
+| `skill_engine.py` | **Intent Middleware:** Scans messages for skill triggers, manages scoring, and performs system prompt injection. |
+| `vision_module.py` | **Vision Translator:** Converts Ollama-style image payloads into OpenAI-compatible multipart/base64 requests. |
+| `tool_manager.py` | **Execution Authority:** Manages the `SHELL_SERVER_URL`, executes `ingest_url` (knowledge base) and `run_shell` (remote execution) commands. |
+| `session_manager.py` | **State Authority:** Maintains deterministic `session_id` via SHA-256 and manages the set of active skills per session. |
+| `stream_handler.py` | **Stream Interceptor:** Manages SSE buffering, detects `tool_calls` in the stream, and triggers execution before yielding results. |
+| `shell_server.py` | **Execution Agent:** Discovers local IP, registers itself via UDP/HTTP handshake, and executes arbitrary shell commands. |
 
-### Module Breakdown
-- `proxy.py`: Main entry point. Handles basic Ollama API routing, version checks, protocol translation for embeddings, and provides the `/register_shell` endpoint for tool configuration.
-- `skill_engine.py`: 
-    - **Intent Detection:** Middleware that scans prompts for skill triggers.
-    - **Lifecycle Management:** Manages skill activation and session persistence.
-- `vision_module.py`: Translates Ollama image formats to OpenAI multipart requests.
-- `tool_manager.py`: Intercepts tool calls and manages local execution. Includes `ingest_url` for knowledge base management and `run_shell` for remote command execution.
-- `session_manager.py`: Handles session persistence and active skill state across the conversation.
+---
 
-### Tool Execution
-#### Shell Tool & Registration
-- **`run_shell` tool:** Allows the model to execute arbitrary shell commands on a remote or local server.
-- **Registration Handshake:**
-    1. `shell_server.py` starts and discovers its local IP address.
-    2. `shell_server.py` POSTs its full URL to `proxy.py:/register_shell`.
-    3. `proxy.py` receives the URL and stores it in `tool_manager.py:SHELL_SERVER_URL`.
-    4. `tool_manager.py:execute_tool` uses this stored URL to route all `run_shell` commands to the correct server.
+## 2. The Request/Response Pipeline
 
-## Implementation Phases
-1. **Phase 1: Extraction.** Move vision and tool logic into standalone modules. (COMPLETED)
-2. **Phase 2: Skill Engine.** Implement the `SkillEngine` with a dedicated trigger-detection middleware. (COMPLETED)
-3. **Phase 3: Session Refactor.** Transition skill state management to the `SessionManager`. (COMPLETED)
-4. **Phase 4: Cleanup.** Strip `proxy.py` down to a clean router.
+Trace of a single user message from Open-WebUI:
 
-## Constraints
-- Must maintain 100% compatibility with the Ollama API for Open-WebUI.
-- Must follow the "Interface-First" principle to ensure modules are easily testable.
+1.  **Ingress:** `proxy.py` receives `POST /api/chat`.
+2.  **Command Interception:** `proxy.py` checks if the message is a manual `.run` command. If so, it bypasses the LLM and calls `tool_manager.process_manual_command`.
+3.  **Skill Injection:** `skill_engine.process_message` is called. It calculates scores, updates `session_manager`, and prepends the "Active Skill" system prompt to the message history.
+4.  **Translation:** `vision_module.to_openai_messages` transforms the message history (including images) into OpenAI format.
+5.  **LLM Dispatch:** `proxy.py` forwards the translated payload to the downstream LLM (e.g., `llama.cpp`).
+6.  **Stream Interception:** `stream_handler.generate_streaming_chat` intercepts the SSE stream.
+    -   If `delta.content` is found: Yield to client.
+    -   If `delta.tool_calls` is found: Enter **Buffering State**.
+7.  **Tool Execution:** Upon `finish_reason: tool_calls`, the buffer is parsed and sent to `tool_manager.execute_tool`.
+8.  **Result Injection:** The tool output is yielded back to the client as a new assistant message.
+9.  **Egress:** The final stream/response is sent back to Open-WebUI.
+
+---
+
+## 3. Protocol Mapping Table
+
+| Ollama API Endpoint | Proxy Logic | OpenAI API Equivalent |
+| :--- | :--- | :--- |
+| `POST /api/chat` | `proxy.py:chat` $\to$ `skill_engine` $\to$ `stream_handler` | `POST /v1/chat/completions` |
+| `POST /api/embed` | `proxy.py:embeddings` (Prompt $\to$ Input) | `POST /v1/embeddings` |
+| `GET /api/tags` | `proxy.py:tags` (Stubbed) | N/A |
+| `POST /register_shell` | `proxy.py:register_shell` $\to$ `tool_manager` | N/A |
+
+---
+
+## 4. System Environment
+
+### Required Environment Variables
+- `LLAMA_BASE`: URL of the LLM engine (e.g., `http://localhost:8080`).
+- `INGEST_BASE`: URL of the knowledge base ingestion service.
+- `EMBEDDING_BASE`: URL of the embedding service.
+- `PROXY_URL`: The public/reachable URL of the proxy (used by `shell_server` for registration).
+
+### Port Mapping
+- `11434`: `proxy.py` (Ollama API compatibility).
+- `8000`: `shell_server.py` (Command execution).
+- `8083`: Ingestion Service.
+- `8080`: LLM Engine.
+
+---
+
+## 5. Refactor Status
+
+- [DONE] `proxy.py` (Thin Router)
+- [DONE] `skill_engine.py` (Intent Middleware)
+- [DONE] `vision_module.py` (Vision Translator)
+- [DONE] `tool_manager.py` (Execution Authority)
+- [DONE] `session_manager.py` (State Authority)
+- [DONE] `stream_handler.py` (Stream Interceptor)
+- [DONE] `shell_server.py` (Execution Agent)
