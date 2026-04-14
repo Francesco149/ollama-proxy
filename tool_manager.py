@@ -1,6 +1,7 @@
 import httpx
 import asyncio
 import logging
+import re
 
 log = logging.getLogger("tool")
 
@@ -8,6 +9,8 @@ SHELL_SERVER_URL = None
 
 INGEST_BASE = "http://localhost:8083"
 _ingest_sem = asyncio.Semaphore(2)  # max 2 concurrent
+
+SHELL_EXTRACT_PATTERN = re.compile(r'`````\s*(.*?)\s*`````', re.DOTALL)
 
 def set_shell_url(url: str):
     global SHELL_SERVER_URL
@@ -41,6 +44,46 @@ TOOLS = [
         }
     }
 ]
+
+async def process_manual_command(messages: list) -> str | None:
+    if not messages:
+        return None
+    
+    last_msg = messages[-1]
+    if last_msg.get("role") != "user":
+        return None
+    
+    content = last_msg.get("content", "").strip()
+    
+    if content == ".run":
+        # Iterate backwards to find the most recent assistant message
+        assistant_msg = None
+        for msg in reversed(messages[:-1]):
+            if msg.get("role") == "assistant":
+                assistant_msg = msg
+                break
+        
+        if not assistant_msg:
+            return "No assistant message found to extract commands from."
+        
+        matches = SHELL_EXTRACT_PATTERN.findall(assistant_msg.get("content", ""))
+        if not matches:
+            return "No shell commands found in the last assistant message."
+        
+        results = []
+        for cmd in matches:
+            res = await execute_tool("run_shell", {"command": cmd.strip()})
+            results.append(res)
+        
+        return "\n\n---\n\n".join(results)
+
+    if content.startswith(".run "):
+        cmd = content[5:].strip()
+        if not cmd:
+            return "No command provided after .run"
+        return await execute_tool("run_shell", {"command": cmd})
+
+    return None
 
 async def execute_tool(name: str, args: dict) -> str:
     log.info(f"[tool] execute name={name} args={args}")
