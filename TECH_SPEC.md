@@ -7,7 +7,7 @@
 | `proxy.py` | **Thin Router:** Entry point. Handles Ollama API routing, version stubs, embedding protocol translation, and the `/register_shell` endpoint. |
 | `skill_engine.py` | **Intent Middleware:** Scans messages for skill triggers, manages scoring, and performs system prompt injection. |
 | `vision_module.py` | **Vision Translator:** Converts Ollama-style image payloads into OpenAI-compatible multipart/base64 requests. |
-| `tool_manager.py` | **Execution Authority:** Manages the `SHELL_SERVER_URL`, executes `ingest_url` (knowledge base) and `run_shell` (remote execution) commands. |
+| `tool_manager.py` | **Execution Authority:** Manages the `SHELL_SERVER_URL`, executes `ingest_url` (knowledge base) and `run_shell` (remote execution) commands, and acts as a command dispatcher for shorthands (e.g., `.diff`). |
 | `session_manager.py` | **State Authority:** Maintains deterministic `session_id` via SHA-256 and manages the set of active skills per session. |
 | `stream_handler.py` | **Stream Interceptor:** Manages SSE buffering, detects `tool_calls` in the stream, and triggers execution before yielding results. |
 | `shell_server.py` | **Execution Agent:** Discovers local IP, registers itself via UDP/HTTP handshake, and executes arbitrary shell commands. |
@@ -19,7 +19,7 @@
 Trace of a single user message from Open-WebUI:
 
 1.  **Ingress:** `proxy.py` receives `POST /api/chat`.
-2.  **Command Interception:** `proxy.py` checks if the message is a manual `.run` command. If so, it bypasses the LLM and calls `tool_manager.process_manual_command`.
+2.  **Command Interception:** `proxy.py` checks if the message is a manual command (starts with `.`). If so, it bypasses the LLM and calls `tool_manager.process_manual_command`.
 3.  **Skill Injection:** `skill_engine.process_message` is called. It calculates scores, updates `session_manager`, and prepends the "Active Skill" system prompt to the message history.
 4.  **Translation:** `vision_module.to_openai_messages` transforms the message history (including images) into OpenAI format.
 5.  **LLM Dispatch:** `proxy.py` forwards the translated payload to the downstream LLM (e.g., `llama.cpp`).
