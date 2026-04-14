@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import re
 
 from vision_module import to_openai_messages
-from tool_manager import TOOLS, execute_tool, set_shell_url
+from tool_manager import TOOLS, execute_tool, set_shell_url, process_manual_command
 from session_manager import SessionManager
 from skill_engine import SkillEngine
 from stream_handler import handle_non_streaming_chat, generate_streaming_chat
@@ -153,65 +153,11 @@ async def chat(request: Request):
     # ─── STRICT USER-ONLY COMMAND INTERCEPTOR ──────────────────────────────────
     if len(messages) > 0 and messages[-1].get("role") == "user":
         user_input = messages[-1].get("content", "").strip()
-        
         if user_input.startswith(".run"):
-            command_to_run = None
-            
-            # Case A: Manual Override: User types ".run <command>"
-            if user_input.startswith(".run ") and len(user_input) > 5:
-                command_to_run = user_input[5:].strip()
-                log.info(f"[proxy] FORCE: Manual user command -> {command_to_run}")
-                # We treat a single manual command as a list of one
-                commands_to_execute = [command_to_run]
-            
-            # Case B: History Extraction: User types ".run"
-            elif user_input == ".run":
-                log.info(f"[proxy] Searching history for ALL quintuple backtick blocks...")
-                
-                last_assistant_msg = None
-                for msg in reversed(messages[:-1]):
-                    if msg.get("role") == "assistant":
-                        last_assistant_msg = msg.get("content", "")
-                        break
-                
-                if last_assistant_msg:
-                    # FINDALL returns all matches in the string
-                    matches = SHELL_EXTRACT_PATTERN.findall(last_assistant_msg)
-                    if matches:
-                        commands_to_execute = [m.strip() for m in matches if m.strip()]
-                        log.info(f"[proxy] Extracted {len(commands_to_execute)} commands from history.")
-                    else:
-                        return JSONResponse(content={
-                            "message": {"role": "assistant", "content": "❌ Error: No commands found inside quintuple backticks (`````) in my last response."}
-                        })
-                else:
-                    return JSONResponse(content={
-                        "message": {"role": "assistant", "content": "❌ Error: No assistant history found."}
-                    })
-            else:
-                commands_to_execute = []
-
-            # Execution Phase: Iterate through all found commands
-            if commands_to_execute:
-                from tool_manager import execute_tool
-                combined_results = []
-                
-                for cmd in commands_to_execute:
-                    log.info(f"[proxy] Executing command: {cmd}")
-                    res = await execute_tool("run_shell", {"command": cmd})
-                    combined_results.append(f"**Command:** `{cmd}`\n{res}")
-
-                # Return all results joined by newlines
-                return JSONResponse(content={
-                    "message": {
-                        "role": "assistant", 
-                        "content": "\n\n---\n\n".join(combined_results)
-                    }
-                })
-            else:
-                return JSONResponse(content={
-                    "message": {"role": "assistant", "content": "❌ Error: No commands found to execute."}
-                })
+            result = await process_manual_command(messages)
+            if result:
+                return JSONResponse(content={"message": {"role": "assistant", "content": result}})
+            return JSONResponse(content={"message": {"role": "assistant", "content": "❌ Error: No commands found."}})
 
     # If the message was NOT from a user starting with .run, proceed to standard LLM flow
     # ───────────────────────────────────────────────────────────────────────────
