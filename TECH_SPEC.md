@@ -17,6 +17,15 @@ The goal is to move from a single file to a modular service where `proxy.py` act
 - `tool_manager.py`: Intercepts tool calls and manages local execution. Includes `ingest_url` for knowledge base management and `run_shell` for remote command execution.
 - `session_manager.py`: Handles session persistence and active skill state across the conversation.
 
+### Tool Execution
+#### Shell Tool & Registration
+- **`run_shell` tool:** Allows the model to execute arbitrary shell commands on a remote or local server.
+- **Registration Handshake:**
+    1. `shell_server.py` starts and discovers its local IP address.
+    2. `shell_server.py` POSTs its full URL to `proxy.py:/register_shell`.
+    3. `proxy.py` receives the URL and stores it in `tool_manager.py:SHELL_SERVER_URL`.
+    4. `tool_manager.py:execute_tool` uses this stored URL to route all `run_shell` commands to the correct server.
+
 ## Implementation Phases
 1. **Phase 1: Extraction.** Move vision and tool logic into standalone modules. (COMPLETED)
 2. **Phase 2: Skill Engine.** Implement the `SkillEngine` with a dedicated trigger-detection middleware. (COMPLETED)
