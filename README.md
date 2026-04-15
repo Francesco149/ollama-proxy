@@ -2,13 +2,20 @@
 
 > **WARNING**: This project is an ad-hoc tool. Most of the code has been generated or refactored with AI assistance. Use with caution.
 
-A personal, ad-hoc tool designed to bridge LLMs (via Ollama/llama.cpp) with a local shell environment. It enables an agentic workflow where the LLM can inspect, edit, and execute code within your local workspace.
+A personal, ad-hoc tool designed to bridge LLMs (via Ollama/llama.cpp) with a local shell environment.
+
+The main feature is a custom agentic workflow in Open WebUI where the LLM can surgically explore and probe your code by running shell commands like grep in your project folder.
+
+This keeps the context small and maintains very quick response times from the LLM as it methodically gathers information and navigates the codebase.
+
+I currently use this with gemma4 a4b `q3_k_m` and it's a very responsive and viable local AI coding workflow which wrote most of this code and spec files.
 
 ## Quick Start
 
 1. **Configure**:
    - `cp config.example.toml config.toml`
    - Edit `config.toml` with your service URLs (LLM, Ingestion, Embedding).
+   - Make sure to put the skills repo in the dir you specify here.
 2. **Start the Proxy**:
    - `python proxy.py` (Ensure your LLM engine is running).
 3. **Start the Shell Server**:
@@ -20,7 +27,7 @@ A personal, ad-hoc tool designed to bridge LLMs (via Ollama/llama.cpp) with a lo
 This is how a typical session looks when using the agentic skills:
 
 ```text
-user: #code let's refactor the port logic
+user: #code let's refactor the port logic. project folder is /opt/ai-lab/ollama-proxy
 agent: I'll need to find where the port is currently defined. Please run:
 `git -C /opt/ai-lab/ollama-proxy grep -r "port" .`
 user: .run
