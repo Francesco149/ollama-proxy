@@ -45,14 +45,16 @@ Trace of a single user message from Open-WebUI:
 
 ## 4. System Environment
 
-### Configuration
-- **`config.toml`**: Contains the following service URLs (populated from `config.example.toml`):
-    - `LLAMA_BASE`: URL of the LLM engine (e.g., `http://localhost:8080`).
-    - `INGEST_BASE`: URL of the knowledge base ingestion service.
-    - `EMBEDDING_BASE`: URL of the embedding service.
+### Configuration File
+- **`config.toml`**: Contains the following service settings:
+    - `llama_base`: URL of the LLM engine (e.g., `http://localhost:8080`).
+    - `ingest_base`: URL of the knowledge base ingestion service.
+    - `embedding_base`: URL of the embedding service.
+    - `model_name`: The name of the model to use.
+- The configuration is loaded from `/opt/ai-lab/ollama-proxy/config.toml` by default, or from the path specified in the `OLLAMA_PROXY_CONFIG` environment variable.
 
 ### Required Environment Variables
-- `PROXY_URL`: Required only for the `shell_server` process (used for registration).
+- `PROXY_URL`: Required specifically for the standalone `shell_server` process (used for registration).
 
 ### Port Mapping
 - `11434`: `proxy.py` (Ollama API compatibility).
