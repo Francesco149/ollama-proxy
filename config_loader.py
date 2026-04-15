@@ -22,7 +22,7 @@ def _load_config() -> Dict[str, Any]:
     """
     Loads the configuration from the specified TOML file.
     """
-    config_path = os.environ.get("OLLAMA_PROXY_CONFIG", "config.toml")
+    config_path = os.environ.get("OLLAMA_PROXY_CONFIG", "/opt/ai-lab/ollama-proxy/config.toml")
 
     if tomllib is None:
         logger.error("No TOML parser found. Please install 'tomli' (for Python < 3.11).")
