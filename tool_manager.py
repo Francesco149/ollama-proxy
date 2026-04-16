@@ -136,7 +136,7 @@ async def execute_tool(name: str, args: dict) -> str:
             try:
                 log.info(f"[tool] ingesting {url}")
                 async with _ingest_sem:
-                    async with httpx.AsyncClient(timeout=600) as client:
+                    async with httpx.AsyncClient(timeout=86400) as client:
                         log.info(f"[tool] ingest_url {url}")
                         resp = await client.post(f"{INGEST_BASE}/ingest", json={"url": url, "note": note})
                         r = resp.json()
