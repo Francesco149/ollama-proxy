@@ -17,22 +17,29 @@ class SkillEngine:
     def _load_skills(self):
         config = get_config()
         skills_cfg = config.get("skills", {})
-        self.skills_dir = skills_cfg.get("dir", "/opt/ai-lab/skills")
+        
+        skills_dir_cfg = skills_cfg.get("dir", "/opt/ai-lab/skills")
+        if isinstance(skills_dir_cfg, str):
+            self.skills_dir = [skills_dir_cfg]
+        else:
+            self.skills_dir = skills_dir_cfg
+
         self.max_skills = skills_cfg.get("max_skills", 2)
         self.min_score = skills_cfg.get("min_score", 0.15)
 
         self.skills = {}
         self.triggers = {}
-        for path in glob.glob(os.path.join(self.skills_dir, "*.md")):
-            name = os.path.basename(path).replace(".md", "")
-            with open(path) as f:
-                content = f.read()
-            self.skills[name] = content
-            match = re.match(r'^---\s*\ntriggers:\s*(.+?)\n---', content, re.DOTALL)
-            self.triggers[name] = (
-                set(match.group(1).strip().lower().split()) if match
-                else set(content[:300].lower().split())
-            )
+        for directory in self.skills_dir:
+            for path in glob.glob(os.path.join(directory, "*.md")):
+                name = os.path.basename(path).replace(".md", "")
+                with open(path) as f:
+                    content = f.read()
+                self.skills[name] = content
+                match = re.match(r'^---\s*\ntriggers:\s*(.+?)\n---', content, re.DOTALL)
+                self.triggers[name] = (
+                    set(match.group(1).strip().lower().split()) if match
+                    else set(content[:300].lower().split())
+                )
 
     def score(self, message: str, trigger_words: set) -> float:
         words = message.lower().split()
