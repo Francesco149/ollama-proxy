@@ -21,33 +21,7 @@ def set_shell_url(url: str):
 
 # ── tool schemas ──────────────────────────────────────────────────────────────
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "ingest_url",
-            "description": (
-                "Save one or more URLs to the knowledge base. Use when the user shares links and asks to "
-                "remember, save, archive, or learn from them. Works with YouTube videos, articles, and web pages."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "urls": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of URLs to ingest",
-                    },
-                    "note": {
-                        "type": "string",
-                        "description": "Optional note about why these are being saved",
-                    },
-                },
-                "required": ["urls"],
-            },
-        },
-    }
-]
+TOOLS = []
 
 # ── tool execution ────────────────────────────────────────────────────────────
 
@@ -163,9 +137,12 @@ async def process_manual_command(messages: list) -> str | None:
     handlers = {
         ".run": _handle_run,
         ".diff": _handle_diff,
+        ".fetch": None,
     }
 
     if content in handlers:
+        if content == ".fetch":
+            return "No URL provided for .fetch"
         return await handlers[content](messages)
 
     for prefix, handler in handlers.items():
@@ -175,6 +152,11 @@ async def process_manual_command(messages: list) -> str | None:
                 if not cmd:
                     return f"No command provided after {prefix}"
                 return await execute_tool("run_shell", {"command": cmd})
+            elif prefix == ".fetch":
+                url = content[len(prefix) + 1:].strip()
+                if not url:
+                    return f"No URL provided after {prefix}"
+                return await execute_tool("ingest_url", {"urls": [url]})
             else:
                 return await handler(messages)
 
