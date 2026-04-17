@@ -1,62 +1,51 @@
-# ollama-proxy — Behavioral Specification
+# ollama-proxy
 
-This document defines the formal behavioral logic of the `ollama-proxy` system. It serves as the authoritative specification for state management, tool orchestration, and service discovery.
-
----
-
-## 1. Session Identity & Persistence
-
-The system maintains conversation state through a deterministic session identification mechanism.
-
-### 1.1 Session ID Generation
-- **Trigger:** The first message in a conversation where `role == "user"`.
-- **Algorithm:** `SHA-256` hash of the raw string content of that message.
-- **Truncation:** The first 16 characters of the hex digest are used as the `session_id`.
-- **Scope:** This ID is used as the primary key for all stateful lookups in the `SessionManager`.
-
-### 1.2 Skill Accumulation (Set Union)
-- **Mechanism:** The `SkillEngine` performs continuous scoring of incoming messages against the local skill library.
-- **State Update:** When a skill is triggered, the `SessionManager` performs a **Set Union** operation:
-  `active_skills[session_id] = active_skills[session_id].union(newly_detected_skills)`
-- **Persistence:** Skills are accumulated over the lifetime of the session. Once a skill is added to the session set, it remains active for all subsequent messages in that session until the proxy process restarts or the session is explicitly cleared.
+Proxy between Open-WebUI and llama.cpp that adds: per-session skill injection, tool execution (shell + knowledge base ingest), and Ollama API compatibility.
 
 ---
 
-## 2. Tool Interception & Streaming Logic
+## Data Flow
 
-The proxy acts as an interceptor between the LLM (llama.cpp) and the local execution environment.
-
-### 2.1 Buffer-and-Trigger Mechanism
-- **Detection:** The proxy monitors the incoming SSE (Server-Sent Events) stream from the LLM.
-- **Buffering:** If a chunk contains `delta.tool_calls`, the proxy enters a "Buffering State." It accumulates the `function.name` and `function.arguments` (JSON string) across subsequent chunks.
-- **Trigger Condition:** The trigger occurs when the LLM emits a `finish_reason` of `"tool_calls"` or when the stream terminates while in the "Buffering State."
-
-### 2.2 Execution Flow
-1. **Parse:** The accumulated JSON string is parsed into a structured dictionary.
-2. **Execute:** The `tool_manager` is invoked with the parsed arguments.
-3. **Stream Result:** The output of the tool execution is captured and streamed back to the client (Open-WebUI) as a standard assistant text message, ensuring the user sees the tool's result immediately.
-
----
-
-## 3. Registration Handshake (Service Discovery)
-
-The system utilizes an HTTP-based registration pattern to connect external shell environments to the proxy.
-
-### 3.1 HTTP Registration
-- **Mechanism:** The `shell_server` (or external agent) performs an HTTP POST request to the `/register_shell` endpoint on the proxy.
-- **Handshake:**
-    1. **Discovery:** The `shell_server` uses a UDP socket locally to discover its own IP address.
-    2. **Registration:** Upon receiving the HTTP POST request, the proxy extracts the service URL from the request body.
-    3. **Binding:** The URL is stored in the global `shell_url` state via `set_shell_url()`.
-- **Purpose:** This allows the proxy to dynamically know where to route manual command executions without hardcoded configuration changes.
+```
+Open-WebUI
+    │
+    ▼
+proxy.py ──dot-command?──► tool_manager.process_manual_command
+    │
+    ├─► skill_engine.process_message        (injects active skills into system prompt)
+    │       └─► session_manager             (tracks active skills per session)
+    │
+    ├─► vision_module.to_openai_messages    (translates Ollama image payloads → OpenAI)
+    │
+    └─► stream_handler                      (SSE interception + tool-call buffering)
+            └─► execute_tool [injected]     (passed in by proxy, not imported)
+                    └─► shell_server        (HTTP, port 8000)
+```
 
 ---
 
-## 4. Summary of Architectural Constraints
+## Module Index
 
-| Component | Responsibility | Logic Pattern |
-| :--- | :--- | :--- |
-| **SessionManager** | State Authority | Deterministic Hashing & Set Union |
-| **SkillEngine** | Context Injection | Trigger-Coverage Scoring |
-| **Proxy Streamer** | Protocol Translation | Buffer-and-Trigger Interception |
-| **ToolManager** | Command Execution | HTTP-based Registration |
+| Module | Role |
+| --- | --- |
+| `proxy.py` | Thin router, Ollama API stubs, module wiring |
+| `skill_engine.py` | Skill scoring + system prompt injection |
+| `session_manager.py` | Session identity and active skill state |
+| `stream_handler.py` | SSE buffering, tool-call interception |
+| `tool_manager.py` | Tool schemas, execution, shell URL state, dot-commands |
+| `vision_module.py` | Ollama → OpenAI image format translation |
+| `config_loader.py` | TOML config singleton |
+| `shell_server.py` | Standalone shell execution agent |
+
+Spec for each module: `modules/<module>/SPEC.md`
+
+---
+
+## Ports
+
+| Port | Service |
+| --- | --- |
+| 11434 | `proxy.py` (Ollama-compatible API) |
+| 8000 | `shell_server.py` |
+| 8080 | llama.cpp |
+| 8083 | Ingest service |
