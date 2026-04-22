@@ -24,6 +24,9 @@ class CommandRequest(BaseModel):
 class PythonCodeRequest(BaseModel):
     code: str
 
+class ShellScriptRequest(BaseModel):
+    script: str
+
 @app.post("/exec")
 async def exec_command(request: CommandRequest):
     log.info(f"[shell] executing command: {request.command}")
@@ -42,6 +45,35 @@ async def exec_command(request: CommandRequest):
         "stderr": stderr.decode().strip(),
         "exit_code": exit_code
     }
+
+@app.post("/exec_shell")
+async def exec_shell(request: ShellScriptRequest):
+    log.info("[shell] executing shell script")
+    
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(dir='.', suffix='.sh', delete=False) as tmp:
+        tmp_path = tmp.name
+        tmp.write(request.script.encode('utf-8'))
+    
+    try:
+        process = await asyncio.create_subprocess_shell(
+            f"bash {tmp_path}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await process.communicate()
+        exit_code = process.returncode
+
+        return {
+            "stdout": stdout.decode().strip(),
+            "stderr": stderr.decode().strip(),
+            "exit_code": exit_code
+        }
+    finally:
+        # Ensure the file is deleted
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 @app.post("/exec_python")
 async def exec_python(request: PythonCodeRequest):

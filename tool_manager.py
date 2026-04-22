@@ -91,7 +91,10 @@ async def _execute_shell(args: dict) -> str:
     try:
         log.info(f"running shell command: {command}")
         async with httpx.AsyncClient(timeout=600) as client:
-            resp = await client.post(f"{SHELL_SERVER_URL}/exec", json={"command": command})
+            if "\n" in command:
+                resp = await client.post(f"{SHELL_SERVER_URL}/exec_shell", json={"script": command})
+            else:
+                resp = await client.post(f"{SHELL_SERVER_URL}/exec", json={"command": command})
             r = resp.json()
         stdout = r.get("stdout", "")
         stderr = r.get("stderr", "")
