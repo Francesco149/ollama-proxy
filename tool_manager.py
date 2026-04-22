@@ -10,7 +10,8 @@ SHELL_SERVER_URL = None
 
 _ingest_sem = asyncio.Semaphore(2)
 
-SHELL_EXTRACT_PATTERN = re.compile(r'`````\s*(.*?)\s*`````', re.DOTALL)
+RE_SHELL = re.compile(r'`````\s*(.*?)\s*`````', re.DOTALL)
+RE_PYTHON = re.compile(r'`````\s*(.*?)\s*`````', re.DOTALL)
 
 # ── shell URL state ───────────────────────────────────────────────────────────
 
@@ -33,6 +34,9 @@ async def execute_tool(name: str, args: dict) -> str:
 
     if name == "run_shell":
         return await _execute_shell(args)
+
+    if name == "run_python":
+        return await _execute_python(args)
 
     return f"Unknown tool: {name}"
 
@@ -102,6 +106,31 @@ async def _execute_shell(args: dict) -> str:
         log.error(f"run_shell exception: {e}", exc_info=True)
         return f"Error executing shell command: {e}"
 
+
+async def _execute_python(args: dict) -> str:
+    code = args.get("code")
+    if not code:
+        return "No code provided for run_python"
+    if not SHELL_SERVER_URL:
+        return "Shell server URL is not configured"
+    try:
+        log.info(f"running python code: {code}")
+        async with httpx.AsyncClient(timeout=600) as client:
+            resp = await client.post(f"{SHELL_SERVER_URL}/exec_python", json={"code": code})
+            r = resp.json()
+        stdout = r.get("stdout", "")
+        stderr = r.get("stderr", "")
+        exit_code = r.get("exit_code", 0)
+        result = f"Python executed (exit code: `{exit_code}`)\n"
+        if stdout:
+            result += f"### STDOUT:\n`````\n{stdout}\n`````\n"
+        if stderr:
+            result += f"### STDERR:\n`````\n{stderr}\n`````\n"
+        return result
+    except Exception as e:
+        log.error(f"run_python exception: {e}", exc_info=True)
+        return f"Error executing python code: {e}"
+
 # ── dot-command dispatcher ────────────────────────────────────────────────────
 
 async def _handle_run(messages: list) -> str:
@@ -112,12 +141,30 @@ async def _handle_run(messages: list) -> str:
             break
     if not assistant_msg:
         return "No assistant message found to extract commands from."
-    matches = SHELL_EXTRACT_PATTERN.findall(assistant_msg.get("content", ""))
+    matches = RE_SHELL.findall(assistant_msg.get("content", ""))
     if not matches:
         return "No shell commands found in the last assistant message."
     results = []
     for cmd in matches:
         res = await execute_tool("run_shell", {"command": cmd.strip()})
+        results.append(res)
+    return "\n\n---\n\n".join(results)
+
+
+async def _handle_py(messages: list) -> str:
+    assistant_msg = None
+    for msg in reversed(messages[:-1]):
+        if msg.get("role") == "assistant":
+            assistant_msg = msg
+            break
+    if not assistant_msg:
+        return "No assistant message found to extract python code from."
+    matches = RE_PYTHON.findall(assistant_msg.get("content", ""))
+    if not matches:
+        return "No python code found in the last assistant message."
+    results = []
+    for code in matches:
+        res = await execute_tool("run_python", {"code": code.strip()})
         results.append(res)
     return "\n\n---\n\n".join(results)
 
@@ -136,6 +183,7 @@ async def process_manual_command(messages: list) -> str | None:
 
     handlers = {
         ".run": _handle_run,
+        ".py": _handle_py,
         ".diff": _handle_diff,
         ".fetch": None,
     }
