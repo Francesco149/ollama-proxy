@@ -10,8 +10,8 @@ SHELL_SERVER_URL = None
 
 _ingest_sem = asyncio.Semaphore(2)
 
-RE_SHELL = re.compile(r'`````\s*(.*?)\s*`````', re.DOTALL)
-RE_PYTHON = re.compile(r'`````\s*(.*?)\s*`````', re.DOTALL)
+RE_SHELL = re.compile(r'<run-shell>(.*?)</run-shell>', re.DOTALL)
+RE_PYTHON = re.compile(r'<run-python>(.*?)</run-python>', re.DOTALL)
 
 # ── shell URL state ───────────────────────────────────────────────────────────
 
@@ -114,7 +114,7 @@ async def _execute_python(args: dict) -> str:
     if not SHELL_SERVER_URL:
         return "Shell server URL is not configured"
     try:
-        log.info(f"running python code: {code}")
+        log.info(f"running python code: {code[:50]}...")
         async with httpx.AsyncClient(timeout=600) as client:
             resp = await client.post(f"{SHELL_SERVER_URL}/exec_python", json={"code": code})
             r = resp.json()
@@ -141,12 +141,20 @@ async def _handle_run(messages: list) -> str:
             break
     if not assistant_msg:
         return "No assistant message found to extract commands from."
-    matches = RE_SHELL.findall(assistant_msg.get("content", ""))
-    if not matches:
-        return "No shell commands found in the last assistant message."
+    
+    content = assistant_msg.get("content", "")
+    shell_matches = RE_SHELL.findall(content)
+    python_matches = RE_PYTHON.findall(content)
+    
+    if not shell_matches and not python_matches:
+        return "No shell or python commands found in the last assistant message."
+    
     results = []
-    for cmd in matches:
+    for cmd in shell_matches:
         res = await execute_tool("run_shell", {"command": cmd.strip()})
+        results.append(res)
+    for code in python_matches:
+        res = await execute_tool("run_python", {"code": code.strip()})
         results.append(res)
     return "\n\n---\n\n".join(results)
 
@@ -183,7 +191,6 @@ async def process_manual_command(messages: list) -> str | None:
 
     handlers = {
         ".run": _handle_run,
-        ".py": _handle_py,
         ".diff": _handle_diff,
         ".fetch": None,
     }
