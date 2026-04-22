@@ -13,9 +13,10 @@ None — runs as a completely separate process with no internal module dependenc
 - On startup: discovers local IP via UDP socket trick (`connect("8.8.8.8", 80)`), then POSTs `{"url": "http://<local_ip>:8000"}` to `{PROXY_URL}/register_shell`
 - `PROXY_URL` must be set as an environment variable; logs an error and skips registration if absent
 - `POST /exec`: runs `request.command` in a subprocess shell asynchronously, returns `{stdout, stderr, exit_code}`
+- `POST /exec_python`: runs provided Python code in a temporary file using `sys.executable`, returns `{stdout, stderr, exit_code}`
 - All subprocess execution uses `asyncio.create_subprocess_shell` — never blocking calls
 
 ## Must NOT
 - Import from any other internal module
-- Expose any endpoint other than `POST /exec`
+- Expose any endpoint other than `POST /exec` and `POST /exec_python`
 - Run commands synchronously
