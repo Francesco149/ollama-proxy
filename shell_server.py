@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import socket
+import sys
+import tempfile
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -18,6 +20,9 @@ app = FastAPI()
 
 class CommandRequest(BaseModel):
     command: str
+
+class PythonCodeRequest(BaseModel):
+    code: str
 
 @app.post("/exec")
 async def exec_command(request: CommandRequest):
@@ -37,6 +42,35 @@ async def exec_command(request: CommandRequest):
         "stderr": stderr.decode().strip(),
         "exit_code": exit_code
     }
+
+@app.post("/exec_python")
+async def exec_python(request: PythonCodeRequest):
+    log.info("[shell] executing python code")
+    
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(dir='.', suffix='.py', delete=False) as tmp:
+        tmp_path = tmp.name
+        tmp.write(request.code.encode('utf-8'))
+    
+    try:
+        process = await asyncio.create_subprocess_shell(
+            f"{sys.executable} {tmp_path}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await process.communicate()
+        exit_code = process.returncode
+
+        return {
+            "stdout": stdout.decode().strip(),
+            "stderr": stderr.decode().strip(),
+            "exit_code": exit_code
+        }
+    finally:
+        # Ensure the file is deleted
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 @app.on_event("startup")
 async def startup():
