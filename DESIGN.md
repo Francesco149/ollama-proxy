@@ -1,6 +1,6 @@
 # ollama-proxy
 
-Proxy between Open-WebUI and llama.cpp that adds: per-session skill injection, tool execution (shell + knowledge base ingest), and Ollama API compatibility.
+Proxy between Open-WebUI and llama.cpp that adds: per-session skill injection, tool execution (shell + python + knowledge base ingest), and Ollama API compatibility.
 
 ---
 
