@@ -35,7 +35,7 @@ proxy.py ──dot-command?──► tool_manager.process_manual_command
 | `tool_manager.py` | Tool schemas, execution, shell URL state, dot-commands |
 | `vision_module.py` | Ollama → OpenAI image format translation |
 | `config_loader.py` | TOML config singleton |
-| `shell_server.py` | Standalone shell execution agent |
+| `shell_server.py` | Standalone shell and Python execution agent |
 
 Spec for each module: `modules/<module>/SPEC.md`
 
