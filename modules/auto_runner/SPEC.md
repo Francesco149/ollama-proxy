@@ -1,10 +1,12 @@
 # auto_runner
 
 ## Purpose
-Orchestrates the agentic auto-run loop with mid-stream interruption and
-tool-call support. Streams each LLM response live to the caller, handles
-two event types — XML command blocks and `spawn_agent` tool calls — then
-injects results back into message history and loops with a fresh LLM call.
+Orchestrates the agentic auto-run loop with mid-stream interruption.
+Handles three XML command types — `<run-shell>`, `<run-python>`,
+`<spawn-agent>` — all on the same tag-detection path. The HTTP stream
+is broken the instant any closing tag lands in the accumulator, before
+the model predicts any tokens after it. Results are injected as
+`role: "user"` messages, which the model cannot hallucinate.
 
 ## Exports
 ```python
@@ -21,69 +23,52 @@ async def run_agentic_chat(
 ## Internal helpers
 
 ```python
-_AUTORUN_TOOLS: list[dict]
-# Filtered subset of TOOLS containing only "spawn_agent".
-# run_shell/run_python are intentionally excluded — they arrive via XML
-# tags; offering them as tool-call schemas alongside XML causes confusion.
+_RE_FIRST_CMD: re.Pattern
+# Matches the first complete block across all three tag types.
 
-async def _stream_until_event(
-    openai_body: dict,
-    llama_base: str,
-    model_name: str,
-) -> AsyncGenerator[tuple[str, str, str | None, any], None]
+async def _stream_until_event(...) -> AsyncGenerator[tuple, None]
+# Yields (chunk_str, accumulated, event_type, payload).
+# event_type: None | "shell" | "python" | "agent"
+# payload: str (command/code) or dict (parsed spawn-agent JSON body)
+# Breaks the HTTP stream immediately on any closing tag.
+
+def _parse_spawn_agent(body: str) -> dict
+# Parses the JSON body of a <spawn-agent> block. Returns {} on failure.
 ```
 
-Yields `(chunk_str, accumulated, event_type, payload)`:
-- `event_type=None`: normal content token or clean finish
-- `event_type="shell"`: complete `<run-shell>…</run-shell>` detected;
-  payload is the command string; HTTP stream broken immediately
-- `event_type="python"`: complete `<run-python>…</run-python>` detected;
-  payload is the code string; HTTP stream broken immediately
-- `event_type="tool_call"`: `finish_reason=="tool_calls"` received;
-  payload is `{"name": str, "args": dict}`; `chunk_str` is `""`
+## Why tool-call protocol is NOT used in this module
+After a few injected `<command-output>` / `role: "user"` turns, models
+lose the tool-call framing established at the start of the conversation
+and fall back to inventing ad-hoc text syntax (e.g. `/spawn_agent …`).
+Using a single consistent XML-tag mechanism for all three command types
+avoids this entirely. `tools` and `tool_choice` are stripped from the
+body before each llama.cpp call.
 
-## Anti-hallucination design
-
-**Mid-stream interruption (XML commands):** The moment a closing
-`</run-shell>` or `</run-python>` tag appears in the accumulator, the
-httpx stream is broken before the model generates any further tokens.
-This prevents pattern-completion of fake output.
-
-**User-role injection (XML results):** Results injected as `role: "user"`.
-The model has no learned pattern for predicting the user turn.
-
-**Tool-call protocol (spawn_agent):** Tool calls run to
-`finish_reason=="tool_calls"` — the model emits no text content during
-accumulation so there is nothing to hallucinate. Results injected using
-the correct `role: "tool"` multi-turn format, which is equally opaque
-to prediction.
+## spawn-agent tag format
+```
+<spawn-agent>{"prompt": "...", "file_path": "/abs/path", "context": "..."}</spawn-agent>
+```
+`file_path` and `context` are optional. The body is parsed as JSON;
+a parse failure yields an error result without breaking the loop.
 
 ## Behavior Rules
-
-### Per iteration
-- Builds body as `{**openai_body, messages: messages, stream: true,
-  tools: _AUTORUN_TOOLS, tool_choice: "auto"}`; never mutates `openai_body`
+- Builds `{**openai_body, messages: messages, stream: true}` each iteration;
+  removes `tools` and `tool_choice`; never mutates `openai_body`
 - Forwards content tokens live to caller; skips empty `chunk_str` yields
-- On `event_type=None` (clean finish) → yield `{done: true}` and return
-
-### XML command events
-- Yields `⚙️ Running…` progress chunk
-- Executes via `execute_tool_fn("run_shell"|"run_python", {key: payload})`
-- Tracks `consecutive_failures`: increments on non-zero exit
-  (detected by absence of `"exit code: \`0\`"` in result), resets to 0 on success
-- If `consecutive_failures >= max_consecutive_failures` → yield warning, yield done, return
-- Injects: `{role: "assistant", content: accumulated}` +
+- **Clean finish** (no tag found): yield `{done: true}`, return
+- **shell / python events**:
+  - Yield `⚙️ Running…`, execute, yield result
+  - Track `consecutive_failures` (increment on non-zero exit, reset on success)
+  - If `consecutive_failures >= max_consecutive_failures`: yield warning, done, return
+- **agent events**:
+  - Yield `🤖 Spawning sub-agent…`, execute `spawn_agent`, yield result
+  - Does NOT affect `consecutive_failures`
+- All results injected as:
+  `{role: "assistant", content: accumulated}` +
   `{role: "user", content: "<command-output>\n…\n</command-output>\n\nContinue…"}`
 
-### Tool call events (spawn_agent)
-- Yields `🤖 Spawning sub-agent…` progress chunk
-- Executes via `execute_tool_fn(name, args)`; does NOT affect failure counter
-- Injects: `{role: "assistant", content: accumulated, tool_calls: [{id, type, function}]}` +
-  `{role: "tool", tool_call_id: "call_0", content: result}`
-- `tool_call_id` is hardcoded to `"call_0"` (single tool call per turn)
-
 ## Must NOT
-- Import from `stream_handler` — owns its own streaming loop
+- Import from `stream_handler` — owns its own httpx streaming loop
 - Import from `proxy.py`, `session_manager`, or `skill_engine`
-- Offer `run_shell`/`run_python` as tool schemas — XML tags only for those
+- Pass `tools` or `tool_choice` to llama.cpp
 - Hold any state between requests (fully stateless per-call)
