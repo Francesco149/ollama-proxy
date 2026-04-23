@@ -5,7 +5,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from vision_module import to_openai_messages
-from tool_manager import TOOLS, execute_tool, set_shell_url, process_manual_command
+from tool_manager import TOOLS, execute_tool, set_shell_url, set_llm_config, process_manual_command
+from auto_runner import run_agentic_chat
 from session_manager import SessionManager
 from skill_engine import SkillEngine
 from stream_handler import handle_non_streaming_chat, generate_streaming_chat
@@ -27,6 +28,11 @@ INGEST_BASE = server_cfg.get("ingest_base", "http://localhost:8083")
 EMBEDDING_BASE = server_cfg.get("embedding_base", "http://localhost:6080")
 MODEL_NAME = server_cfg.get("model_name", "gemma4")
 
+autorun_cfg = config.get("autorun", {})
+AUTORUN_ENABLED = autorun_cfg.get("enabled", False)
+AUTORUN_MAX_ITER = autorun_cfg.get("max_iterations", 10)
+AUTORUN_MAX_FAILURES = autorun_cfg.get("max_consecutive_failures", 3)
+
 REAL_MODEL = None
 
 # ── app + singletons ──────────────────────────────────────────────────────────
@@ -47,6 +53,8 @@ async def startup():
     global REAL_MODEL
     REAL_MODEL = await _resolve_real_model()
     log.info(f"real model: {REAL_MODEL}")
+    set_llm_config(LLAMA_BASE, REAL_MODEL)
+    log.info(f"autorun enabled={AUTORUN_ENABLED} max_iter={AUTORUN_MAX_ITER} max_failures={AUTORUN_MAX_FAILURES}")
 
 # ── ollama stubs ──────────────────────────────────────────────────────────────
 
@@ -167,6 +175,19 @@ async def chat(request: Request):
 
     if not stream:
         return await handle_non_streaming_chat(openai_body, MODEL_NAME, LLAMA_BASE, execute_tool)
+
+    if AUTORUN_ENABLED:
+        return StreamingResponse(
+            run_agentic_chat(
+                openai_body,
+                MODEL_NAME,
+                LLAMA_BASE,
+                execute_tool,
+                max_iterations=AUTORUN_MAX_ITER,
+                max_consecutive_failures=AUTORUN_MAX_FAILURES,
+            ),
+            media_type="application/x-ndjson",
+        )
 
     return StreamingResponse(
         generate_streaming_chat(openai_body, MODEL_NAME, LLAMA_BASE, execute_tool),

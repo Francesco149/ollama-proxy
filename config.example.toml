@@ -10,3 +10,13 @@ embedding_base = "http://localhost:6080"
 model_name = "gemma4"
 proxy_port = 11434
 shell_server_port = 8000
+
+[autorun]
+# When enabled, <run-shell> and <run-python> blocks emitted by the LLM are
+# executed automatically and their output is injected back into context so
+# the LLM can continue reasoning without user intervention.
+# max_iterations: hard cap on how many command-execute-continue cycles to allow
+# max_consecutive_failures: stop if this many iterations in a row produce non-zero exits
+enabled = false
+max_iterations = 10
+max_consecutive_failures = 3

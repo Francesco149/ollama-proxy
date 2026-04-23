@@ -7,6 +7,8 @@ from config_loader import get_config
 log = logging.getLogger("tool-manager")
 
 SHELL_SERVER_URL = None
+_LLM_BASE: str | None = None
+_LLM_MODEL: str | None = None
 
 _ingest_sem = asyncio.Semaphore(2)
 
@@ -20,9 +22,59 @@ def set_shell_url(url: str):
     SHELL_SERVER_URL = url
     log.info(f"SHELL_SERVER_URL set to {url}")
 
+
+def set_llm_config(llm_base: str, llm_model: str) -> None:
+    global _LLM_BASE, _LLM_MODEL
+    _LLM_BASE = llm_base
+    _LLM_MODEL = llm_model
+    log.info(f"LLM config set: base={llm_base} model={llm_model}")
+
 # ── tool schemas ──────────────────────────────────────────────────────────────
 
-TOOLS = []
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_agent",
+            "description": (
+                "Spawn a focused sub-agent with a fresh context window to analyze a file "
+                "or answer a specific question. Use this to inspect a module's interface, "
+                "summarize findings, or assess how to approach a change — without loading "
+                "the full file into the main context. Returns a concise analysis with "
+                "function names, signatures, and line numbers as relevant."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "Specific question or task for the sub-agent. "
+                            "Ask for function signatures, line numbers, interfaces, "
+                            "or targeted patterns relevant to your current task. "
+                            "The more precise, the more useful the response."
+                        ),
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to a file to load into the sub-agent's context. "
+                            "The full file contents will be visible to the sub-agent only."
+                        ),
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "Current task context so the sub-agent gives relevant answers. "
+                            "Example: 'We are adding an auto-run feature to tool_manager.'"
+                        ),
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+]
 
 # ── tool execution ────────────────────────────────────────────────────────────
 
@@ -37,6 +89,9 @@ async def execute_tool(name: str, args: dict) -> str:
 
     if name == "run_python":
         return await _execute_python(args)
+
+    if name == "spawn_agent":
+        return await _execute_spawn_agent(args)
 
     return f"Unknown tool: {name}"
 
@@ -133,6 +188,62 @@ async def _execute_python(args: dict) -> str:
     except Exception as e:
         log.error(f"run_python exception: {e}", exc_info=True)
         return f"Error executing python code: {e}"
+
+async def _execute_spawn_agent(args: dict) -> str:
+    prompt = args.get("prompt", "")
+    file_path = args.get("file_path")
+    context = args.get("context", "")
+
+    if not _LLM_BASE or not _LLM_MODEL:
+        return "❌ Sub-agent not configured — call set_llm_config first"
+
+    file_content = ""
+    if file_path:
+        if not SHELL_SERVER_URL:
+            return "❌ Shell server not registered — cannot read file"
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{SHELL_SERVER_URL}/exec",
+                    json={"command": f"cat '{file_path}'"},
+                )
+                r = resp.json()
+            if r.get("exit_code") != 0:
+                return f"❌ Failed to read {file_path}: {r.get('stderr', 'unknown error')}"
+            file_content = r.get("stdout", "")
+            log.info(f"spawn_agent: read {len(file_content)} chars from {file_path}")
+        except Exception as e:
+            log.error(f"spawn_agent file read error: {e}", exc_info=True)
+            return f"❌ Error reading file: {e}"
+
+    parts: list[str] = []
+    if context:
+        parts.append(f"Task context: {context}")
+    if file_content:
+        parts.append(f'<file path="{file_path}">\n{file_content}\n</file>')
+    parts.append(prompt)
+    user_content = "\n\n".join(parts)
+
+    log.info(f"spawn_agent: sub-agent call, prompt_len={len(user_content)}")
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                f"{_LLM_BASE}/v1/chat/completions",
+                json={
+                    "model": _LLM_MODEL,
+                    "messages": [{"role": "user", "content": user_content}],
+                    "stream": False,
+                    "max_tokens": 2048,
+                },
+            )
+            data = resp.json()
+        result = data["choices"][0]["message"]["content"]
+        log.info("spawn_agent: sub-agent response received")
+        return f"### Sub-agent analysis\n\n{result}"
+    except Exception as e:
+        log.error(f"spawn_agent LLM call error: {e}", exc_info=True)
+        return f"❌ Sub-agent call failed: {e}"
+
 
 # ── dot-command dispatcher ────────────────────────────────────────────────────
 
