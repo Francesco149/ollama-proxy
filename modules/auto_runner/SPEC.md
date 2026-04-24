@@ -1,12 +1,13 @@
 # auto_runner
 
 ## Purpose
-Orchestrates the agentic auto-run loop with mid-stream interruption.
-Handles three XML command types — `<run-shell>`, `<run-python>`,
-`<spawn-agent>` — all on the same tag-detection path. The HTTP stream
-is broken the instant any closing tag lands in the accumulator, before
-the model predicts any tokens after it. Results are injected as
-`role: "user"` messages, which the model cannot hallucinate.
+Orchestrates the agentic auto-run loop with mid-stream interruption and
+collapsible result display. Handles three XML command types —
+`<run-shell>`, `<run-python>`, `<spawn-agent>` — all on the same
+tag-detection path. The HTTP stream is broken the instant any closing
+tag lands in the accumulator. Results are rendered as collapsed
+`<details>` blocks for the user and injected as plain-text `role=user`
+messages into the LLM context.
 
 ## Exports
 ```python
@@ -26,49 +27,62 @@ async def run_agentic_chat(
 _RE_FIRST_CMD: re.Pattern
 # Matches the first complete block across all three tag types.
 
+_RE_EXIT_CODE: re.Pattern
+# Extracts numeric exit code from tool_manager's formatted result string.
+
 async def _stream_until_event(...) -> AsyncGenerator[tuple, None]
 # Yields (chunk_str, accumulated, event_type, payload).
 # event_type: None | "shell" | "python" | "agent"
-# payload: str (command/code) or dict (parsed spawn-agent JSON body)
 # Breaks the HTTP stream immediately on any closing tag.
 
-def _parse_spawn_agent(body: str) -> dict
-# Parses the JSON body of a <spawn-agent> block. Returns {} on failure.
+def _collapsible(summary: str, body: str) -> str
+# Wraps body in a <details><summary>…</summary>…</details> block.
+# Yielded as a single chunk so HTML is always well-formed.
+
+def _shell_summary(cmd: str, result: str) -> str
+def _python_summary(code: str, result: str) -> str
+def _agent_summary(prompt: str, file_path: str | None) -> str
+# Build the <summary> line for each event type.
+# Shell/python include exit-code status icon (✓ / ✗ exit N).
+# Agent shows prompt preview and file path.
+
+def _exit_code(result: str) -> int | None
+# Parses exit code from result string. Returns None if not found.
 ```
 
-## Why tool-call protocol is NOT used in this module
-After a few injected `<command-output>` / `role: "user"` turns, models
-lose the tool-call framing established at the start of the conversation
-and fall back to inventing ad-hoc text syntax (e.g. `/spawn_agent …`).
-Using a single consistent XML-tag mechanism for all three command types
-avoids this entirely. `tools` and `tool_choice` are stripped from the
-body before each llama.cpp call.
-
-## spawn-agent tag format
-```
-<spawn-agent>{"prompt": "...", "file_path": "/abs/path", "context": "..."}</spawn-agent>
-```
-`file_path` and `context` are optional. The body is parsed as JSON;
-a parse failure yields an error result without breaking the loop.
+## Display vs context separation
+- **Display (Open WebUI):** each result yielded as one `_collapsible()` chunk
+  with a descriptive summary line and the raw result as body
+- **LLM context:** plain-text result injected as `role=user` with
+  `<command-output>…</command-output>` wrapper — no HTML ever enters
+  the model's reasoning context
 
 ## Behavior Rules
 - Builds `{**openai_body, messages: messages, stream: true}` each iteration;
   removes `tools` and `tool_choice`; never mutates `openai_body`
-- Forwards content tokens live to caller; skips empty `chunk_str` yields
-- **Clean finish** (no tag found): yield `{done: true}`, return
-- **shell / python events**:
-  - Yield `⚙️ Running…`, execute, yield result
-  - Track `consecutive_failures` (increment on non-zero exit, reset on success)
-  - If `consecutive_failures >= max_consecutive_failures`: yield warning, done, return
-- **agent events**:
-  - Yield `🤖 Spawning sub-agent…`, execute `spawn_agent`, yield result
+- **Clean finish** (no tag): yield `{done: true}`, return
+- **shell / python events:**
+  - Execute via `execute_tool_fn`
+  - Parse exit code via `_exit_code()`; track `consecutive_failures`
+    (increment on non-zero, reset to 0 on success)
+  - Yield single `_collapsible()` chunk
+  - Circuit-breaker: if `consecutive_failures >= max_consecutive_failures`
+    → yield warning, yield done, return
+- **agent events:**
+  - Execute `spawn_agent` via `execute_tool_fn`
+  - Yield single `_collapsible()` chunk
   - Does NOT affect `consecutive_failures`
 - All results injected as:
   `{role: "assistant", content: accumulated}` +
   `{role: "user", content: "<command-output>\n…\n</command-output>\n\nContinue…"}`
 
+## Why tool-call protocol is not used
+After several `role=user` injections, models lose the tool-call framing
+and invent ad-hoc text syntax. All three command types use XML tags for
+consistency. `tools` and `tool_choice` are stripped from each request.
+
 ## Must NOT
 - Import from `stream_handler` — owns its own httpx streaming loop
 - Import from `proxy.py`, `session_manager`, or `skill_engine`
-- Pass `tools` or `tool_choice` to llama.cpp
+- Yield HTML inside the `role=user` injected context
 - Hold any state between requests (fully stateless per-call)

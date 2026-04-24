@@ -6,20 +6,15 @@ from typing import Callable, Awaitable, AsyncGenerator
 
 log = logging.getLogger("auto-runner")
 
-# All three command types use XML tags in the autorun loop.
-# Tool-call protocol is dropped here: after a few injected <command-output>
-# turns the model loses the tool-call framing and falls back to inventing
-# its own ad-hoc text syntax. Keeping everything on one consistent XML path
-# avoids that entirely.
-#
-# Matches the FIRST complete block in the accumulator. Checked after every
-# token so the HTTP stream can be broken the instant the closing tag lands.
 _RE_FIRST_CMD = re.compile(
     r'(<run-shell>(.*?)</run-shell>'
     r'|<run-python>(.*?)</run-python>'
     r'|<spawn-agent>(.*?)</spawn-agent>)',
     re.DOTALL,
 )
+
+# Extracts exit code from tool_manager's formatted result string
+_RE_EXIT_CODE = re.compile(r'exit code: `(\d+)`')
 
 
 def _make_chunk(model: str, content: str, done: bool = False) -> str:
@@ -39,23 +34,57 @@ def _parse_spawn_agent(body: str) -> dict:
         return {}
 
 
-async def _stream_until_event(
-    openai_body: dict,
-    llama_base: str,
-    model_name: str,
-):
+def _exit_code(result: str) -> int | None:
+    """Extract numeric exit code from a tool_manager result string, or None."""
+    m = _RE_EXIT_CODE.search(result)
+    return int(m.group(1)) if m else None
+
+
+def _collapsible(summary: str, body: str) -> str:
+    """
+    Wrap body in a collapsed <details> block.
+
+    Yielded to Open WebUI as a single chunk after execution — never
+    split across multiple yields so the HTML is always well-formed.
+
+    The raw result (without this wrapper) is what gets injected into
+    the LLM context so no HTML leaks into the model's reasoning.
+    """
+    return f"\n<details>\n<summary>{summary}</summary>\n\n{body}\n</details>\n"
+
+
+def _shell_summary(cmd: str, result: str) -> str:
+    code = _exit_code(result)
+    status = "✓" if code == 0 else f"✗ exit {code}" if code is not None else "✗"
+    preview = cmd[:72] + ("…" if len(cmd) > 72 else "")
+    return f"<code>$ {preview}</code> &nbsp; {status}"
+
+
+def _python_summary(code: str, result: str) -> str:
+    code_val = _exit_code(result)
+    status = "✓" if code_val == 0 else f"✗ exit {code_val}" if code_val is not None else "✗"
+    first_line = code.strip().split("\n")[0][:72]
+    return f"🐍 <code>{first_line}</code> &nbsp; {status}"
+
+
+def _agent_summary(prompt: str, file_path: str | None) -> str:
+    preview = prompt[:80] + ("…" if len(prompt) > 80 else "")
+    suffix = f" — <code>{file_path}</code>" if file_path else ""
+    return f"🤖 {preview}{suffix}"
+
+
+async def _stream_until_event(openai_body: dict, llama_base: str, model_name: str):
     """
     Streams from llama.cpp token by token.
 
     Yields (chunk_str, accumulated, event_type, payload):
-      event_type=None      — normal token or clean finish
-      event_type="shell"   — payload: command str
-      event_type="python"  — payload: code str
-      event_type="agent"   — payload: {"prompt", "file_path"?, "context"?}
+      event_type=None    — normal token or clean finish
+      event_type="shell" — payload: command str
+      event_type="python"— payload: code str
+      event_type="agent" — payload: {"prompt", "file_path"?, "context"?}
 
-    For all three events the HTTP stream is broken immediately on the
-    closing tag — before the model predicts any tokens after it.
-    chunk_str on an event yield is the token that completed the tag.
+    HTTP stream is broken the instant any closing tag lands in the
+    accumulator — before the model predicts any tokens after it.
     """
     accumulated = ""
 
@@ -75,7 +104,6 @@ async def _stream_until_event(
                     delta = choice["delta"]
                     finish = choice.get("finish_reason")
 
-                    # Ignore tool-call frames — not used in autorun mode
                     if delta.get("tool_calls"):
                         continue
 
@@ -103,7 +131,6 @@ async def _stream_until_event(
                     log.warning(f"chunk parse error: {e}")
                     continue
 
-    # Clean finish — no event detected
     yield "", accumulated, None, None
 
 
@@ -116,12 +143,15 @@ async def run_agentic_chat(
     max_consecutive_failures: int = 3,
 ):
     """
-    Agentic loop with mid-stream interruption.
+    Agentic loop with mid-stream interruption and collapsible result blocks.
 
-    All three command types (<run-shell>, <run-python>, <spawn-agent>) share
-    the same XML-tag path. The HTTP stream is broken the instant any closing
-    tag appears in the accumulator, before the model can hallucinate output.
-    Results are injected as role=user — a turn the model cannot predict.
+    Anti-hallucination:
+    - HTTP stream broken on closing tag before model predicts after it
+    - Results injected as role=user (plain text, no HTML)
+
+    Display:
+    - Each result rendered as a <details> block collapsed by default
+    - Summary line shows command preview + pass/fail at a glance
     """
     messages = list(openai_body["messages"])
     consecutive_failures = 0
@@ -129,7 +159,6 @@ async def run_agentic_chat(
     for iteration in range(max_iterations):
         log.info(f"auto-run iteration {iteration}, messages={len(messages)}")
 
-        # No tools/tool_choice — everything goes through XML tags
         body = {**openai_body, "messages": messages, "stream": True}
         body.pop("tools", None)
         body.pop("tool_choice", None)
@@ -165,14 +194,13 @@ async def run_agentic_chat(
         if event_type in ("shell", "python"):
             tool_name = "run_shell" if event_type == "shell" else "run_python"
             arg_key   = "command"   if event_type == "shell" else "code"
-            preview   = (payload or "")[:80]
+            preview   = (payload or "")[:72]
 
             log.info(f"iteration {iteration}: {tool_name}: {preview!r}")
-            yield _make_chunk(model_name, "\n\n⚙️ Running…\n")
 
             result = await execute_tool_fn(tool_name, {arg_key: payload})
 
-            had_failure = "exit code: `0`" not in result
+            had_failure = (_exit_code(result) or 0) != 0
             consecutive_failures = (consecutive_failures + 1) if had_failure else 0
             if not had_failure:
                 consecutive_failures = 0
@@ -180,7 +208,12 @@ async def run_agentic_chat(
             if had_failure:
                 log.warning(f"non-zero exit, consecutive_failures={consecutive_failures}")
 
-            yield _make_chunk(model_name, result + "\n")
+            if event_type == "shell":
+                summary = _shell_summary(payload or "", result)
+            else:
+                summary = _python_summary(payload or "", result)
+
+            yield _make_chunk(model_name, _collapsible(summary, result))
 
             if consecutive_failures >= max_consecutive_failures:
                 log.warning(f"circuit-breaker fired at {consecutive_failures} failures")
@@ -197,24 +230,22 @@ async def run_agentic_chat(
             prompt    = payload.get("prompt", "")
             file_path = payload.get("file_path")
             context   = payload.get("context", "")
-            preview   = prompt[:60]
 
             if not prompt:
-                log.warning(f"iteration {iteration}: spawn-agent missing prompt, skipping")
+                log.warning(f"iteration {iteration}: spawn-agent missing prompt")
                 result = "❌ spawn-agent: missing prompt field in JSON body"
+                yield _make_chunk(model_name, f"\n{result}\n")
             else:
-                log.info(f"iteration {iteration}: spawn-agent: {preview!r}")
-                yield _make_chunk(model_name, "\n\n🤖 Spawning sub-agent…\n")
+                log.info(f"iteration {iteration}: spawn-agent: {prompt[:60]!r}")
                 result = await execute_tool_fn("spawn_agent", {
                     "prompt": prompt,
-                    **({"file_path": file_path} if file_path else {}),
-                    **({"context": context} if context else {}),
+                    **( {"file_path": file_path} if file_path else {}),
+                    **( {"context": context}     if context   else {}),
                 })
+                summary = _agent_summary(prompt, file_path)
+                yield _make_chunk(model_name, _collapsible(summary, result))
 
-            yield _make_chunk(model_name, result + "\n")
-            # spawn-agent results don't count toward the failure circuit-breaker
-
-        # ── Inject result as user message (immune to hallucination) ───────────
+        # ── Inject plain-text result into context (no HTML) ───────────────────
         messages.append({"role": "assistant", "content": assistant_content})
         messages.append({
             "role": "user",
