@@ -1,13 +1,10 @@
 # auto_runner
 
 ## Purpose
-Orchestrates the agentic auto-run loop with mid-stream interruption and
-collapsible result display. Handles three XML command types —
-`<run-shell>`, `<run-python>`, `<spawn-agent>` — all on the same
-tag-detection path. The HTTP stream is broken the instant any closing
-tag lands in the accumulator. Results are rendered as collapsed
-`<details>` blocks for the user and injected as plain-text `role=user`
-messages into the LLM context.
+Orchestrates the agentic auto-run loop with mid-stream interruption,
+clean markdown output, and shadow context support via an injected callback.
+Handles three XML command types — `<run-shell>`, `<run-python>`,
+`<spawn-agent>` — on the same tag-detection path.
 
 ## Exports
 ```python
@@ -18,71 +15,56 @@ async def run_agentic_chat(
     execute_tool_fn: Callable[[str, dict], Awaitable[str]],
     max_iterations: int = 10,
     max_consecutive_failures: int = 3,
+    on_clean_turn: Callable[[str, str | None], None] | None = None,
 ) -> AsyncGenerator[str, None]
 ```
 
-## Internal helpers
-
+## on_clean_turn callback
 ```python
-_RE_FIRST_CMD: re.Pattern
-# Matches the first complete block across all three tag types.
+on_clean_turn(assistant_content: str, command_output: str | None)
+```
+Called once per iteration:
+- `assistant_content`: raw LLM prose up to (not including) the command tag
+- `command_output`: plain-text execution result, or `None` on clean finish
 
-_RE_EXIT_CODE: re.Pattern
-# Extracts numeric exit code from tool_manager's formatted result string.
+The callback is responsible for storage. `auto_runner` is fully stateless
+between requests. proxy.py provides a closure over `session_manager` and
+`session_id` as the callback.
 
-async def _stream_until_event(...) -> AsyncGenerator[tuple, None]
-# Yields (chunk_str, accumulated, event_type, payload).
-# event_type: None | "shell" | "python" | "agent"
-# Breaks the HTTP stream immediately on any closing tag.
+## Internal helpers
+```python
+_RE_FIRST_CMD        # matches first complete command block
+_RE_TAG_START        # r'<(run-|spawn-)' — suppresses forwarding early
+_RE_EXIT_CODE        # parses exit code from tool_manager result string
 
-def _collapsible(summary: str, body: str) -> str
-# Wraps body in a <details><summary>…</summary>…</details> block.
-# Yielded as a single chunk so HTML is always well-formed.
+async def _stream_until_event(...)
+# Yields (chunk_str, accumulated, forward, event_type, payload)
+# forward=False once _RE_TAG_START matches — tag content never reaches UI
+# HTTP stream broken immediately on closing tag
 
-def _shell_summary(cmd: str, result: str) -> str
-def _python_summary(code: str, result: str) -> str
-def _agent_summary(prompt: str, file_path: str | None) -> str
-# Build the <summary> line for each event type.
-# Shell/python include exit-code status icon (✓ / ✗ exit N).
-# Agent shows prompt preview and file path.
-
-def _exit_code(result: str) -> int | None
-# Parses exit code from result string. Returns None if not found.
+def _format_result(header, body) -> str   # plain markdown block
+def _shell_header(cmd, result) -> str     # ✓/✗  $ preview
+def _python_header(code, result) -> str   # ✓/✗  🐍 first_line
+def _agent_header(prompt, file_path) -> str  # 🤖 preview — path
+def _exit_code(result) -> int | None
 ```
 
-## Display vs context separation
-- **Display (Open WebUI):** each result yielded as one `_collapsible()` chunk
-  with a descriptive summary line and the raw result as body
-- **LLM context:** plain-text result injected as `role=user` with
-  `<command-output>…</command-output>` wrapper — no HTML ever enters
-  the model's reasoning context
+## Behavior per iteration
+1. Stream LLM tokens live; suppress forwarding once `_RE_TAG_START` fires
+2. Break HTTP stream on first complete command closing tag
+3. Execute via `execute_tool_fn`
+4. Yield `_format_result(header, result)` as a single chunk (plain markdown)
+5. Call `on_clean_turn(assistant_content, result)` — shadow context update
+6. Append clean turns to internal `messages` list for next iteration
+7. On clean finish: call `on_clean_turn(content, None)`, yield done
 
-## Behavior Rules
-- Builds `{**openai_body, messages: messages, stream: true}` each iteration;
-  removes `tools` and `tool_choice`; never mutates `openai_body`
-- **Clean finish** (no tag): yield `{done: true}`, return
-- **shell / python events:**
-  - Execute via `execute_tool_fn`
-  - Parse exit code via `_exit_code()`; track `consecutive_failures`
-    (increment on non-zero, reset to 0 on success)
-  - Yield single `_collapsible()` chunk
-  - Circuit-breaker: if `consecutive_failures >= max_consecutive_failures`
-    → yield warning, yield done, return
-- **agent events:**
-  - Execute `spawn_agent` via `execute_tool_fn`
-  - Yield single `_collapsible()` chunk
-  - Does NOT affect `consecutive_failures`
-- All results injected as:
-  `{role: "assistant", content: accumulated}` +
-  `{role: "user", content: "<command-output>\n…\n</command-output>\n\nContinue…"}`
-
-## Why tool-call protocol is not used
-After several `role=user` injections, models lose the tool-call framing
-and invent ad-hoc text syntax. All three command types use XML tags for
-consistency. `tools` and `tool_choice` are stripped from each request.
+## Circuit-breaker
+- Tracks `consecutive_failures` (non-zero exit code per `_exit_code()`)
+- Resets to 0 on any clean iteration
+- spawn-agent results never count toward failures
+- At `>= max_consecutive_failures`: yield warning, yield done, return
 
 ## Must NOT
-- Import from `stream_handler` — owns its own httpx streaming loop
-- Import from `proxy.py`, `session_manager`, or `skill_engine`
-- Yield HTML inside the `role=user` injected context
-- Hold any state between requests (fully stateless per-call)
+- Import from `proxy.py`, `session_manager`, `skill_engine`, or `stream_handler`
+- Yield HTML (display is plain markdown only)
+- Store any state between requests — fully stateless, callback-driven

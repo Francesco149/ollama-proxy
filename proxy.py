@@ -106,6 +106,26 @@ async def register_shell(request: Request):
     log.info(f"shell registered: {url}")
     return {"status": "ok"}
 
+
+@app.post("/clear_session")
+async def clear_session(request: Request):
+    """
+    Clear the shadow context for a session so the next request starts fresh.
+    Body: {"session_id": "..."} or {} to clear all sessions.
+    """
+    body = await request.json()
+    sid = body.get("session_id")
+    if sid:
+        session_manager.clear_session(sid)
+        log.info(f"cleared session: {sid}")
+        return {"status": "ok", "session_id": sid}
+    else:
+        count = len(session_manager.clean_messages)
+        for s in list(session_manager.clean_messages.keys()):
+            session_manager.clear_session(s)
+        log.info(f"cleared all {count} session(s)")
+        return {"status": "ok", "cleared": count}
+
 # ── embeddings ────────────────────────────────────────────────────────────────
 
 @app.post("/api/embed")
@@ -177,6 +197,45 @@ async def chat(request: Request):
         return await handle_non_streaming_chat(openai_body, MODEL_NAME, LLAMA_BASE, execute_tool)
 
     if AUTORUN_ENABLED:
+        session_id = session_manager.get_session_id(messages)
+        oai_messages = openai_body["messages"]  # already OpenAI-format
+
+        if session_manager.has_clean_context(session_id):
+            # Subsequent turn: append only the new user message to the clean
+            # context, ignoring Open WebUI's display-polluted full history.
+            new_user = next((m for m in reversed(oai_messages) if m["role"] == "user"), None)
+            if new_user:
+                session_manager.append_clean(session_id, new_user)
+            context_messages = session_manager.get_clean_messages(session_id)
+            log.info(f"session {session_id}: resuming clean context ({len(context_messages)} messages)")
+        else:
+            # First turn: seed the clean context with the full incoming messages
+            # (includes skill-engine system prompt + user message).
+            session_manager.init_clean_context(session_id, oai_messages)
+            context_messages = oai_messages
+            log.info(f"session {session_id}: new session, seeding clean context")
+
+        openai_body = {**openai_body, "messages": context_messages}
+
+        def on_clean_turn(assistant_content: str, command_output: str | None) -> None:
+            """
+            Persist each clean agentic iteration to the shadow context.
+            Called by auto_runner with the raw prose (no display artifacts)
+            and the plain-text command result (or None on clean finish).
+            """
+            turns = [{"role": "assistant", "content": assistant_content}]
+            if command_output is not None:
+                turns.append({
+                    "role": "user",
+                    "content": (
+                        f"<command-output>\n{command_output}\n</command-output>\n\n"
+                        "Continue based on the above output."
+                    ),
+                })
+            session_manager.append_clean(session_id, *turns)
+            log.debug(f"session {session_id}: persisted clean turn "
+                      f"({'with output' if command_output else 'final'})")
+
         return StreamingResponse(
             run_agentic_chat(
                 openai_body,
@@ -185,6 +244,7 @@ async def chat(request: Request):
                 execute_tool,
                 max_iterations=AUTORUN_MAX_ITER,
                 max_consecutive_failures=AUTORUN_MAX_FAILURES,
+                on_clean_turn=on_clean_turn,
             ),
             media_type="application/x-ndjson",
         )
