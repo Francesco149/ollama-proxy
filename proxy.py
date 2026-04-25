@@ -229,20 +229,50 @@ async def chat(request: Request):
 
         openai_body = {**openai_body, "messages": context_messages}
 
-        def on_clean_turn(assistant_content: str, command_output: str | None) -> None:
-            """Persist each clean agentic iteration under next_key."""
-            turns = [{"role": "assistant", "content": assistant_content}]
-            if command_output is not None:
+        def on_clean_turn(
+            assistant_content: str,
+            tool_results: list | None,
+        ) -> None:
+            """
+            Persist each clean agentic iteration under next_key.
+            Stores assistant prose + properly formatted role=tool turns so
+            the model sees correct multi-turn context on continuation.
+            """
+            import json as _json
+            turns: list[dict] = []
+
+            if tool_results:
+                # Reconstruct tool_calls array for the assistant message
+                tool_calls_arr = [
+                    {
+                        "id": tr["tool_call_id"],
+                        "type": "function",
+                        "function": {
+                            "name": tr["name"],
+                            "arguments": "{}",  # args already executed; omit for brevity
+                        },
+                    }
+                    for tr in tool_results
+                ]
                 turns.append({
-                    "role": "user",
-                    "content": (
-                        f"<command-output>\n{command_output}\n</command-output>\n\n"
-                        "Continue based on the above output."
-                    ),
+                    "role": "assistant",
+                    "content": assistant_content,
+                    "tool_calls": tool_calls_arr,
                 })
+                for tr in tool_results:
+                    turns.append({
+                        "role": "tool",
+                        "tool_call_id": tr["tool_call_id"],
+                        "content": tr["result"],
+                    })
+            else:
+                turns.append({"role": "assistant", "content": assistant_content})
+
             session_manager.append_clean(next_key, *turns)
-            log.debug(f"context {next_key}: persisted "
-                      f"({'with output' if command_output else 'final'})")
+            log.debug(
+                f"context {next_key}: persisted "
+                f"({len(tool_results)} tool(s)" if tool_results else "(final)"
+            )
 
         return StreamingResponse(
             run_agentic_chat(

@@ -1,19 +1,19 @@
 """
 auto_runner.py
 
-Agentic loop with mid-stream tag suppression, collapsible result blocks,
-and shadow context support via on_clean_turn callback.
+Agentic loop using the model's native tool-call protocol.
 
-Tag suppression: the tail of the accumulator is scanned after every token.
-Characters are held back whenever the tail is a prefix of a known command
-tag — so no part of any tag name ever reaches Open WebUI.  The hold
-distance is computed by _tag_prefix_hold().
+Design:
+- Content tokens stream live to Open WebUI as they arrive
+- Tool calls accumulate via finish_reason="tool_calls", then execute
+- Results injected as role="tool" — the format the model was trained on
+- Shadow context (on_clean_turn) stores only clean prose + tool turns,
+  never any display markup — so the model never sees <details> in history
 
-Collapsibles: safe now that shadow context ensures the model's history
-never contains <details> markup.
-
-All five tag types share one detection path: <run-shell>, <run-python>,
-<spawn-agent>, <write-file>.
+Display:
+- Params block yielded immediately when tool call is decided (before execution)
+- Result block yielded after execution with stripped single-line preview
+- Both are fully closed <details> blocks — no open HTML, no rendering glitches
 """
 
 import httpx
@@ -22,58 +22,131 @@ import logging
 import re
 from typing import Callable, Awaitable, AsyncGenerator
 
+from tool_manager import TOOLS
+
 log = logging.getLogger("auto-runner")
-
-# ── tag detection ─────────────────────────────────────────────────────────────
-
-_TAG_PATTERNS = [
-    "<run-shell>",
-    "<run-python>",
-    "<spawn-agent>",
-    "<write-file>",
-]
-_MAX_TAG_LEN = max(len(p) for p in _TAG_PATTERNS)
-
-_RE_FIRST_CMD = re.compile(
-    r'(<run-shell>(.*?)</run-shell>'
-    r'|<run-python>(.*?)</run-python>'
-    r'|<spawn-agent>(.*?)</spawn-agent>'
-    r'|<write-file>(.*?)</write-file>)',
-    re.DOTALL,
-)
 
 _RE_EXIT_CODE = re.compile(r'exit code: `(\d+)`')
 
 
-def _tag_prefix_hold(text: str) -> int:
-    """
-    Return how many characters at the END of text must be withheld because
-    they could be the opening of a command tag.
+# ── display helpers ───────────────────────────────────────────────────────────
 
-    Works by finding the rightmost '<' in the last _MAX_TAG_LEN characters
-    and checking whether everything from that '<' to the end of text is a
-    prefix of any known tag pattern.
-
-    Examples:
-      "hello <"        → 1   (could start <run-shell>)
-      "hello <run"     → 4   (<run is prefix of <run-shell>/<run-python>)
-      "hello <run-shell>cmd" → 0  (_RE_FIRST_CMD catches this before us)
-      "hello <z"       → 0   (not a prefix of any tag)
-    """
-    search_from = max(0, len(text) - _MAX_TAG_LEN)
-    tail = text[search_from:]
-    lt = tail.rfind("<")
-    if lt == -1:
-        return 0
-    potential = tail[lt:]  # from '<' to end of tail
-    for pat in _TAG_PATTERNS:
-        if pat.startswith(potential):
-            # hold from the '<' to end of text
-            return len(text) - (search_from + lt)
-    return 0
+def _strip_preview(text: str, max_len: int = 160) -> str:
+    """Single-line preview: strip markdown, collapse whitespace."""
+    t = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    t = re.sub(r'`{2,}[^\n]*\n', '', t)          # opening fence lines
+    t = re.sub(r'`{2,}', '', t)                   # closing fences
+    t = re.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', t)
+    t = re.sub(r'`([^`]+)`', r'\1', t)
+    t = re.sub(r'^[\-\*\+]\s+', '', t, flags=re.MULTILINE)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return (t[:max_len] + "…") if len(t) > max_len else t
 
 
-# ── chunk helpers ─────────────────────────────────────────────────────────────
+def _fenced(text: str) -> str:
+    return f"``````\n{text.strip()}\n``````"
+
+
+def _exit_code(result: str) -> int | None:
+    m = _RE_EXIT_CODE.search(result)
+    return int(m.group(1)) if m else None
+
+
+def _details(summary: str, body: str) -> str:
+    """Fully closed collapsed block — double newline ensures block-level rendering."""
+    return f"\n\n<details>\n<summary>{summary}</summary>\n\n{body}\n\n</details>\n"
+
+
+def _params_block(tool_name: str, args: dict) -> str:
+    """Yield immediately when the model decides to call a tool."""
+    icon = {"run_shell": "▶ $", "run_python": "▶ 🐍",
+            "spawn_agent": "🤖", "write_file": "📝"}.get(tool_name, "▶")
+
+    if tool_name == "run_shell":
+        cmd = args.get("command", "")
+        summary = f"{icon}  {cmd[:80]}{'…' if len(cmd)>80 else ''}"
+        body = _fenced(cmd)
+
+    elif tool_name == "run_python":
+        code = args.get("code", "")
+        first = code.strip().split("\n")[0][:80]
+        summary = f"{icon}  {first}"
+        body = _fenced(code)
+
+    elif tool_name == "spawn_agent":
+        prompt    = args.get("prompt", "")
+        file_path = args.get("file_path")
+        files     = args.get("files", [])
+        all_files = list(files) + ([file_path] if file_path and file_path not in files else [])
+        preview   = prompt[:80] + ("…" if len(prompt) > 80 else "")
+        names     = ", ".join(f.split("/")[-1] for f in all_files[:3])
+        if len(all_files) > 3:
+            names += f" +{len(all_files)-3}"
+        summary = f"{icon}  {preview}" + (f"  —  {names}" if names else "")
+
+        parts = []
+        if all_files:
+            parts.append("**Files:**\n" + "\n".join(f"- `{f}`" for f in all_files))
+        if args.get("context"):
+            parts.append(f"**Context:** {args['context']}")
+        parts.append(f"**Prompt:** {prompt}")
+        body = "\n\n".join(parts)
+
+    elif tool_name == "write_file":
+        path   = args.get("path", "")
+        prompt = args.get("prompt", "")
+        summary = f"{icon}  {path}"
+        body = f"**Path:** `{path}`\n\n**Prompt:** {prompt}"
+
+    else:
+        summary = f"▶  {tool_name}"
+        body = _fenced(json.dumps(args, indent=2))
+
+    return _details(summary, body)
+
+
+def _result_block(tool_name: str, args: dict, result: str) -> str:
+    """Yield after execution with result preview as summary."""
+    icon = {"run_shell": "✓ $" if (_exit_code(result) or 0) == 0 else "✗ $",
+            "run_python": "✓ 🐍" if (_exit_code(result) or 0) == 0 else "✗ 🐍",
+            "spawn_agent": "🤖", "write_file": "📝"}.get(tool_name, "✓")
+
+    preview = _strip_preview(result)
+
+    if tool_name == "run_shell":
+        cmd = args.get("command", "")
+        body = f"**Command:**\n\n{_fenced(cmd)}\n\n**Output:**\n\n{_fenced(result)}"
+
+    elif tool_name == "run_python":
+        code = args.get("code", "")
+        body = f"**Code:**\n\n{_fenced(code)}\n\n**Output:**\n\n{_fenced(result)}"
+
+    elif tool_name == "spawn_agent":
+        # Result is already markdown from the sub-agent — no extra fencing
+        body = result
+
+    elif tool_name == "write_file":
+        path = args.get("path", "")
+        lines_m = re.search(r'\((\d+) lines\)', result)
+        n_lines = int(lines_m.group(1)) if lines_m else 0
+        preview_m = re.search(r'```\n(.*?)```', result, re.DOTALL)
+        file_preview = preview_m.group(1) if preview_m else ""
+        preview = f"📝 {path} — {n_lines} lines"
+        body = f"**Path:** `{path}`\n\n**Preview:**\n\n{_fenced(file_preview)}" if file_preview else result
+
+    else:
+        body = _fenced(result)
+
+    # For shell/python prepend the exit-code icon to the preview
+    if tool_name in ("run_shell", "run_python"):
+        code_val = _exit_code(result)
+        status = "✓" if code_val == 0 else (f"✗ exit {code_val}" if code_val is not None else "✗")
+        summary = f"{status}  {preview}"
+    else:
+        summary = f"{icon}  {preview}"
+
+    return _details(summary, body)
+
 
 def _make_chunk(model: str, content: str, done: bool = False) -> str:
     return json.dumps({
@@ -83,123 +156,23 @@ def _make_chunk(model: str, content: str, done: bool = False) -> str:
     }) + "\n"
 
 
-def _parse_json_tag(body: str, tag: str) -> dict:
-    try:
-        return json.loads(body.strip())
-    except Exception as e:
-        log.warning(f"<{tag}> body parse failed: {e!r}")
-        return {}
-
-
-def _exit_code(result: str) -> int | None:
-    m = _RE_EXIT_CODE.search(result)
-    return int(m.group(1)) if m else None
-
-
-# ── display helpers ───────────────────────────────────────────────────────────
-
-def _collapsible(summary: str, body: str) -> str:
-    """
-    Collapsed <details> block. Safe now that shadow context guarantees the
-    model never sees this markup in its own history.
-    Body is passed pre-formatted (fenced or plain markdown).
-    """
-    return f"\n<details>\n<summary>{summary}</summary>\n\n{body}\n</details>\n"
-
-
-def _fenced(text: str) -> str:
-    """6-backtick fence — survives any nested triple/quintuple fences."""
-    return f"``````\n{text.strip()}\n``````"
-
-
-def _shell_summary(cmd: str, result: str) -> str:
-    code = _exit_code(result)
-    icon = "✓" if code == 0 else f"✗ exit {code}" if code is not None else "✗"
-    preview = cmd.strip()[:80] + ("…" if len(cmd.strip()) > 80 else "")
-    return f"{icon}  $ {preview}"
-
-
-def _python_summary(code: str, result: str) -> str:
-    val = _exit_code(result)
-    icon = "✓" if val == 0 else f"✗ exit {val}" if val is not None else "✗"
-    first = code.strip().split("\n")[0][:80]
-    return f"{icon}  🐍 {first}"
-
-
-def _agent_summary(prompt: str, file_path: str | None, files: list | None = None) -> str:
-    preview = prompt[:80] + ("…" if len(prompt) > 80 else "")
-    all_files = list(files or [])
-    if file_path and file_path not in all_files:
-        all_files.insert(0, file_path)
-    if all_files:
-        names = ", ".join(f.split("/")[-1] for f in all_files[:3])
-        if len(all_files) > 3:
-            names += f" +{len(all_files)-3}"
-        suffix = f"  —  {names}"
-    else:
-        suffix = ""
-    return f"🤖  {preview}{suffix}"
-
-
-def _write_summary(path: str, lines: int) -> str:
-    return f"📝  {path}  ({lines} lines written)"
-
-
-def _agent_body(prompt: str, file_path: str | None, files: list | None,
-                context: str, result: str) -> str:
-    parts = []
-    all_files = list(files or [])
-    if file_path and file_path not in all_files:
-        all_files.insert(0, file_path)
-    if all_files:
-        file_list = "\n".join(f"- `{f}`" for f in all_files)
-        parts.append(f"**Files:**\n{file_list}")
-    if context:
-        parts.append(f"**Context:** {context}")
-    parts.append(f"**Prompt:** {prompt}")
-    parts.append("---")
-    parts.append(result)
-    return "\n\n".join(parts)
-
-
-def _write_body(path: str, prompt: str, lines: int, preview: str) -> str:
-    preview_block = _fenced(preview)
-    return (
-        f"**Path:** `{path}`\n\n"
-        f"**Prompt:** {prompt}\n\n"
-        f"**Preview ({lines} lines):**\n\n{preview_block}"
-    )
-
-
-def _shell_body(cmd: str, result: str) -> str:
-    return f"**Command:**\n\n{_fenced(cmd)}\n\n**Output:**\n\n{_fenced(result)}"
-
-
-def _python_body(code: str, result: str) -> str:
-    return f"**Code:**\n\n{_fenced(code)}\n\n**Output:**\n\n{_fenced(result)}"
-
-
 # ── streaming ─────────────────────────────────────────────────────────────────
 
-async def _stream_until_event(openai_body: dict, llama_base: str, model_name: str):
+async def _stream_one_turn(
+    openai_body: dict,
+    llama_base: str,
+    model_name: str,
+) -> AsyncGenerator[tuple, None]:
     """
-    Streams from llama.cpp, withholding any characters that could be the
-    start of a command tag. Yields text pieces incrementally; on detecting
-    a complete command block, yields one event tuple and stops.
+    Stream one LLM turn.
 
-    Yields: (event_type, payload, text)
-      - Normal:  (None, None, text_to_forward)   — incremental safe text
-      - Event:   (type_str, payload, prose_so_far) — command detected
-      - Sentinel: (None, None, "")                — clean finish
+    Yields:
+      ("text",  chunk_str, content)      — forward content token
+      ("tool",  chunk_str, tool_calls)   — model decided to call tools
+      ("done",  "",        full_content) — clean finish, no tool call
     """
-    accumulated = ""
-    forwarded_up_to = 0
-    # Position in accumulated where suppression began (start of the `<`
-    # that opened a potential tag). Once set, forwarded_up_to never
-    # advances past this point — so no part of the tag or its content
-    # ever reaches Open WebUI, even when _tag_prefix_hold() returns 0
-    # for the tag body (e.g. JSON that contains no `<`).
-    suppress_from: int | None = None
+    full_content = ""
+    tool_calls_buf: dict[int, dict] = {}   # index → {name, args_str, id}
 
     async with httpx.AsyncClient(timeout=300) as client:
         async with client.stream(
@@ -214,74 +187,52 @@ async def _stream_until_event(openai_body: dict, llama_base: str, model_name: st
                 try:
                     chunk = json.loads(raw)
                     choice = chunk["choices"][0]
-                    delta = choice["delta"]
+                    delta  = choice["delta"]
                     finish = choice.get("finish_reason")
 
+                    # ── tool call accumulation ────────────────────────────────
                     if delta.get("tool_calls"):
+                        for tc in delta["tool_calls"]:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_buf:
+                                tool_calls_buf[idx] = {"name": "", "args_str": "", "id": ""}
+                            if tc.get("id"):
+                                tool_calls_buf[idx]["id"] = tc["id"]
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                tool_calls_buf[idx]["name"] = fn["name"]
+                            tool_calls_buf[idx]["args_str"] += fn.get("arguments", "")
                         continue
 
+                    if finish == "tool_calls":
+                        tool_calls = []
+                        for idx in sorted(tool_calls_buf):
+                            buf = tool_calls_buf[idx]
+                            try:
+                                args = json.loads(buf["args_str"] or "{}")
+                            except Exception:
+                                args = {}
+                            tool_calls.append({
+                                "id":   buf["id"] or f"call_{idx}",
+                                "name": buf["name"],
+                                "args": args,
+                            })
+                        yield "tool", "", tool_calls
+                        return
+
+                    # ── content token ─────────────────────────────────────────
                     content = delta.get("content", "")
-                    if not content:
-                        if finish in ("stop", "length"):
-                            break
-                        continue
-
-                    accumulated += content
-
-                    # Check for a complete command block first
-                    m = _RE_FIRST_CMD.search(accumulated)
-                    if m:
-                        # Flush prose up to where suppression began (or tag
-                        # start if we never had a partial hold)
-                        prose_end = suppress_from if suppress_from is not None else m.start()
-                        prose_end = min(prose_end, m.start())
-                        if prose_end > forwarded_up_to:
-                            yield None, None, accumulated[forwarded_up_to:prose_end]
-                        prose = accumulated[:m.start()]
-                        g = m.groups()
-                        if g[1] is not None:
-                            yield "shell", g[1].strip(), prose
-                        elif g[2] is not None:
-                            yield "python", g[2].strip(), prose
-                        elif g[3] is not None:
-                            yield "agent", _parse_json_tag(g[3], "spawn-agent"), prose
-                        else:
-                            yield "write", _parse_json_tag(g[4], "write-file"), prose
-                        return  # break HTTP stream immediately
-
-                    # No complete command yet.
-                    # Compute how many tail chars to hold back for a potential tag.
-                    hold = _tag_prefix_hold(accumulated)
-                    if hold > 0 and suppress_from is None:
-                        # Record where clean prose ends — nothing after this
-                        # point will ever be forwarded while suppressing.
-                        suppress_from = len(accumulated) - hold
-
-                    # Only advance forwarded_up_to up to the suppression point
-                    # (or the hold boundary if we haven't started suppressing).
-                    if suppress_from is not None:
-                        safe_end = suppress_from
-                    else:
-                        safe_end = len(accumulated) - hold
-
-                    if safe_end > forwarded_up_to:
-                        chunk_text = accumulated[forwarded_up_to:safe_end]
-                        if chunk_text:
-                            yield None, None, chunk_text
-                        forwarded_up_to = safe_end
+                    if content:
+                        full_content += content
+                        yield "text", _make_chunk(model_name, content), content
 
                     if finish in ("stop", "length"):
                         break
 
                 except Exception as e:
                     log.warning(f"chunk parse error: {e}")
-                    continue
 
-    # Clean finish — flush any held-back tail (safe because no complete tag found)
-    remainder = accumulated[forwarded_up_to:]
-    if remainder:
-        yield None, None, remainder
-    yield None, None, ""  # sentinel
+    yield "done", "", full_content
 
 
 # ── main loop ─────────────────────────────────────────────────────────────────
@@ -293,147 +244,128 @@ async def run_agentic_chat(
     execute_tool_fn: Callable[[str, dict], Awaitable[str]],
     max_iterations: int = 10,
     max_consecutive_failures: int = 3,
-    on_clean_turn: Callable[[str, str | None], None] | None = None,
+    on_clean_turn: Callable[[str, list | None], None] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
-    Agentic loop with mid-stream interruption and collapsible result blocks.
+    Agentic loop using native tool-call protocol.
 
-    on_clean_turn(assistant_prose, command_result_or_None):
-      Called after each iteration so the caller can persist a clean
-      shadow context (no display markup). auto_runner is stateless.
+    on_clean_turn(assistant_content, tool_results_or_None):
+      assistant_content: prose the model generated this turn
+      tool_results_or_None: list of {"tool_call_id", "name", "result"} or None
     """
     messages = list(openai_body["messages"])
     consecutive_failures = 0
 
     for iteration in range(max_iterations):
-        log.info(f"auto-run iteration {iteration}, messages={len(messages)}")
+        log.info(f"iteration {iteration}, messages={len(messages)}")
 
-        body = {**openai_body, "messages": messages, "stream": True}
-        body.pop("tools", None)
-        body.pop("tool_choice", None)
+        body = {
+            **openai_body,
+            "messages": messages,
+            "stream": True,
+            "tools": TOOLS,
+            "tool_choice": "auto",
+        }
 
-        prose_content = ""
-        event_type: str | None = None
-        payload = None
-        result: str = ""
+        prose = ""
+        tool_calls = None
 
-        async for ev_type, ev_payload, text in _stream_until_event(
-            body, llama_base, model_name
-        ):
-            if ev_type is not None:
-                event_type = ev_type
-                payload = ev_payload
-                prose_content = text
+        async for kind, chunk_str, payload in _stream_one_turn(body, llama_base, model_name):
+            if kind == "text":
+                prose += payload
+                yield chunk_str
+
+            elif kind == "tool":
+                tool_calls = payload
                 break
-            if text:
-                prose_content = (prose_content or "") + text
-                yield _make_chunk(model_name, text)
+
+            elif kind == "done":
+                prose = payload
+                break
 
         # ── clean finish ──────────────────────────────────────────────────────
-        if event_type is None:
+        if tool_calls is None:
             log.info(f"iteration {iteration}: clean finish")
             if on_clean_turn:
-                on_clean_turn(prose_content, None)
+                on_clean_turn(prose, None)
             yield _make_chunk(model_name, "", done=True)
             return
 
-        # ── shell / python ────────────────────────────────────────────────────
-        if event_type in ("shell", "python"):
-            tool_name = "run_shell" if event_type == "shell" else "run_python"
-            arg_key   = "command"   if event_type == "shell" else "code"
-            log.info(f"iteration {iteration}: {tool_name}: {(payload or '')[:72]!r}")
+        # ── execute tool calls ────────────────────────────────────────────────
+        tool_results = []
+        had_failure  = False
 
-            result = await execute_tool_fn(tool_name, {arg_key: payload})
+        for tc in tool_calls:
+            name = tc["name"]
+            args = tc["args"]
+            call_id = tc["id"]
 
-            had_failure = (_exit_code(result) or 0) != 0
-            consecutive_failures = (consecutive_failures + 1) if had_failure else 0
-            if not had_failure:
-                consecutive_failures = 0
-            if had_failure:
-                log.warning(f"non-zero exit, consecutive_failures={consecutive_failures}")
+            log.info(f"iteration {iteration}: tool={name} args_keys={list(args)}")
 
-            fn_sum  = _shell_summary  if event_type == "shell" else _python_summary
-            fn_body = _shell_body     if event_type == "shell" else _python_body
-            block = _collapsible(fn_sum(payload or "", result),
-                                 fn_body(payload or "", result))
-            yield _make_chunk(model_name, block)
+            # Params block — yield immediately before execution
+            yield _make_chunk(model_name, _params_block(name, args))
 
-            if consecutive_failures >= max_consecutive_failures:
-                log.warning(f"circuit-breaker fired at {consecutive_failures} failures")
-                yield _make_chunk(
-                    model_name,
-                    f"\n⚠️ Auto-run stopped after {consecutive_failures} consecutive "
-                    "failure(s). Type `.run` to retry manually.\n",
-                )
-                yield _make_chunk(model_name, "", done=True)
-                return
+            result = await execute_tool_fn(name, args)
 
-        # ── spawn-agent ───────────────────────────────────────────────────────
-        elif event_type == "agent":
-            prompt    = payload.get("prompt", "")
-            file_path = payload.get("file_path")
-            context   = payload.get("context", "")
+            # Track failures for shell/python only
+            if name in ("run_shell", "run_python"):
+                code = _exit_code(result)
+                if (code or 0) != 0:
+                    had_failure = True
+                    log.warning(f"non-zero exit for {name}")
 
-            if not prompt:
-                result = "❌ spawn-agent: missing prompt"
-                log.warning(f"iteration {iteration}: spawn-agent missing prompt")
-                yield _make_chunk(model_name, f"\n{result}\n")
-            else:
-                files = payload.get("files", [])
-                n_files = len(files) + bool(file_path)
-                log.info(f"iteration {iteration}: spawn-agent: {prompt[:60]!r} files={n_files}")
-                result = await execute_tool_fn("spawn_agent", {
-                    "prompt": prompt,
-                    **( {"file_path": file_path} if file_path else {}),
-                    **( {"files": files}         if files      else {}),
-                    **( {"context": context}     if context    else {}),
-                })
-                block = _collapsible(
-                    _agent_summary(prompt, file_path, files),
-                    _agent_body(prompt, file_path, files, context, result),
-                )
-                yield _make_chunk(model_name, block)
+            # Result block
+            yield _make_chunk(model_name, _result_block(name, args, result))
 
-        # ── write-file ────────────────────────────────────────────────────────
-        elif event_type == "write":
-            path   = payload.get("path", "")
-            prompt = payload.get("prompt", "")
+            tool_results.append({
+                "tool_call_id": call_id,
+                "name": name,
+                "result": result,
+            })
 
-            if not path or not prompt:
-                result = "❌ write-file: requires 'path' and 'prompt' fields"
-                log.warning(f"iteration {iteration}: write-file missing fields")
-                yield _make_chunk(model_name, f"\n{result}\n")
-            else:
-                log.info(f"iteration {iteration}: write-file: {path!r}")
-                result = await execute_tool_fn("write_file", {
-                    "path": path,
-                    "prompt": prompt,
-                })
-                # Extract line count and preview from result for display
-                # result is a status string; full details in collapsible
-                lines_m = re.search(r'\((\d+) lines\)', result)
-                n_lines = int(lines_m.group(1)) if lines_m else 0
-                preview_m = re.search(r'```\n(.*?)```', result, re.DOTALL)
-                preview = preview_m.group(1) if preview_m else ""
-                block = _collapsible(
-                    _write_summary(path, n_lines),
-                    _write_body(path, prompt, n_lines, preview),
-                )
-                yield _make_chunk(model_name, block)
+        consecutive_failures = (consecutive_failures + 1) if had_failure else 0
 
-        # ── persist clean turn (no display markup) ────────────────────────────
+        if consecutive_failures >= max_consecutive_failures:
+            log.warning(f"circuit-breaker: {consecutive_failures} consecutive failure(s)")
+            yield _make_chunk(
+                model_name,
+                f"\n⚠️ Auto-run stopped after {consecutive_failures} consecutive "
+                "failure(s). Type `.run` to retry manually.\n",
+            )
+            yield _make_chunk(model_name, "", done=True)
+            return
+
+        # ── persist clean turn ────────────────────────────────────────────────
         if on_clean_turn:
-            on_clean_turn(prose_content, result)
+            on_clean_turn(prose, tool_results)
 
-        # ── inject plain-text result into internal loop context ───────────────
-        messages.append({"role": "assistant", "content": prose_content})
+        # ── inject into message history ───────────────────────────────────────
+        # Assistant turn: prose + tool_calls array (OpenAI multi-turn format)
         messages.append({
-            "role": "user",
-            "content": (
-                f"<command-output>\n{result}\n</command-output>\n\n"
-                "Continue based on the above output."
-            ),
+            "role": "assistant",
+            "content": prose,
+            "tool_calls": [
+                {
+                    "id": tr["tool_call_id"],
+                    "type": "function",
+                    "function": {
+                        "name": tr["name"],
+                        "arguments": json.dumps(
+                            next(tc["args"] for tc in tool_calls if tc["id"] == tr["tool_call_id"])
+                        ),
+                    },
+                }
+                for tr in tool_results
+            ],
         })
-        log.info(f"iteration {iteration}: injected, looping")
+        # One role=tool message per result
+        for tr in tool_results:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tr["tool_call_id"],
+                "content": tr["result"],
+            })
+
+        log.info(f"iteration {iteration}: {len(tool_results)} tool result(s) injected, looping")
 
     yield _make_chunk(model_name, "", done=True)

@@ -35,13 +35,56 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "run_shell",
+            "description": (
+                "Execute a shell command on the project host. "
+                "Use for: git commands, reading file trees (git ls-files), "
+                "running scripts, checking diffs. "
+                "Never use ls or find — always git ls-files."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute. May be multi-line for scripts.",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "Execute Python code on the project host. "
+                "Use for: simple refactors (fixing imports, bulk renames), "
+                "scaffolding new files/dirs, data transformations. "
+                "Never implement business logic here — use write_file or aider."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python code to execute.",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "spawn_agent",
             "description": (
-                "Spawn a focused sub-agent with a fresh context window to analyze a file "
-                "or answer a specific question. Use this to inspect a module's interface, "
-                "summarize findings, or assess how to approach a change — without loading "
-                "the full file into the main context. Returns a concise analysis with "
-                "function names, signatures, and line numbers as relevant."
+                "Spawn a focused sub-agent with a fresh context window to analyze one or "
+                "more files. Use to inspect interfaces, plan refactors, validate SPECs, "
+                "or reason across module boundaries — without loading files into the main "
+                "context. The sub-agent sees the full file(s); you receive only its answer."
             ),
             "parameters": {
                 "type": "object",
@@ -49,28 +92,59 @@ TOOLS = [
                     "prompt": {
                         "type": "string",
                         "description": (
-                            "Specific question or task for the sub-agent. "
-                            "Ask for function signatures, line numbers, interfaces, "
-                            "or targeted patterns relevant to your current task. "
-                            "The more precise, the more useful the response."
+                            "Precise question for the sub-agent. Ask for function signatures, "
+                            "line numbers, interface compatibility, or SPEC gaps. "
+                            "End with: Do not include any preamble, be as brief as possible."
                         ),
                     },
                     "file_path": {
                         "type": "string",
+                        "description": "Absolute path to a single file to load (convenience alias for files[0]).",
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
                         "description": (
-                            "Absolute path to a file to load into the sub-agent's context. "
-                            "The full file contents will be visible to the sub-agent only."
+                            "Absolute paths of multiple files to load for cross-module reasoning. "
+                            "Use when checking interface compatibility or tracing calls across modules."
                         ),
                     },
                     "context": {
                         "type": "string",
-                        "description": (
-                            "Current task context so the sub-agent gives relevant answers. "
-                            "Example: 'We are adding an auto-run feature to tool_manager.'"
-                        ),
+                        "description": "Current task context so the sub-agent gives relevant answers.",
                     },
                 },
                 "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Generate a complete file via a sub-agent and write it to disk. "
+                "File content never enters the orchestrator context — you receive only "
+                "a brief status line. Use for new modules or full rewrites. "
+                "Always verify with spawn_agent immediately after."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path where the file should be written.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "Fully self-contained generation prompt. Include: all function "
+                            "signatures, behavior rules, imports, edge cases, logging setup. "
+                            "The agent has no other context."
+                        ),
+                    },
+                },
+                "required": ["path", "prompt"],
             },
         },
     },
