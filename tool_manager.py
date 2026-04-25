@@ -93,6 +93,9 @@ async def execute_tool(name: str, args: dict) -> str:
     if name == "spawn_agent":
         return await _execute_spawn_agent(args)
 
+    if name == "write_file":
+        return await _execute_write_file(args)
+
     return f"Unknown tool: {name}"
 
 
@@ -189,42 +192,64 @@ async def _execute_python(args: dict) -> str:
         log.error(f"run_python exception: {e}", exc_info=True)
         return f"Error executing python code: {e}"
 
+async def _read_file_via_shell(path: str) -> tuple[str, str | None]:
+    """Read a file via shell_server. Returns (content, error_or_None)."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{SHELL_SERVER_URL}/exec",
+                json={"command": f"cat '{path}'"},
+            )
+            r = resp.json()
+        if r.get("exit_code") != 0:
+            return "", f"❌ Failed to read {path}: {r.get('stderr', 'unknown error')}"
+        return r.get("stdout", ""), None
+    except Exception as e:
+        return "", f"❌ Error reading {path}: {e}"
+
+
 async def _execute_spawn_agent(args: dict) -> str:
-    prompt = args.get("prompt", "")
+    """
+    Spawn a sub-agent with one or more files loaded into its context.
+
+    Accepts either:
+      file_path: str          — single file (backward compatible)
+      files: list[str]        — multiple files, each wrapped in <file path="..."> tags
+
+    The sub-agent sees all requested files and responds to `prompt`.
+    `context` is prepended as task context.
+    """
+    prompt    = args.get("prompt", "")
     file_path = args.get("file_path")
-    context = args.get("context", "")
+    files     = args.get("files", [])
+    context   = args.get("context", "")
 
     if not _LLM_BASE or not _LLM_MODEL:
         return "❌ Sub-agent not configured — call set_llm_config first"
+    if not SHELL_SERVER_URL:
+        return "❌ Shell server not registered — cannot read files"
 
-    file_content = ""
-    if file_path:
-        if not SHELL_SERVER_URL:
-            return "❌ Shell server not registered — cannot read file"
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    f"{SHELL_SERVER_URL}/exec",
-                    json={"command": f"cat '{file_path}'"},
-                )
-                r = resp.json()
-            if r.get("exit_code") != 0:
-                return f"❌ Failed to read {file_path}: {r.get('stderr', 'unknown error')}"
-            file_content = r.get("stdout", "")
-            log.info(f"spawn_agent: read {len(file_content)} chars from {file_path}")
-        except Exception as e:
-            log.error(f"spawn_agent file read error: {e}", exc_info=True)
-            return f"❌ Error reading file: {e}"
+    # Normalise to a single list
+    all_paths = list(files)
+    if file_path and file_path not in all_paths:
+        all_paths.insert(0, file_path)
 
     parts: list[str] = []
     if context:
         parts.append(f"Task context: {context}")
-    if file_content:
-        parts.append(f'<file path="{file_path}">\n{file_content}\n</file>')
+
+    for path in all_paths:
+        content, err = await _read_file_via_shell(path)
+        if err:
+            parts.append(err)
+        else:
+            parts.append(f'<file path="{path}">\n{content}\n</file>')
+            log.info(f"spawn_agent: loaded {len(content)} chars from {path}")
+
     parts.append(prompt)
     user_content = "\n\n".join(parts)
 
-    log.info(f"spawn_agent: sub-agent call, prompt_len={len(user_content)}")
+    log.info(f"spawn_agent: calling sub-agent, {len(all_paths)} file(s), prompt_len={len(user_content)}")
     try:
         async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(
@@ -238,11 +263,87 @@ async def _execute_spawn_agent(args: dict) -> str:
             )
             data = resp.json()
         result = data["choices"][0]["message"]["content"]
-        log.info("spawn_agent: sub-agent response received")
-        return f"### Sub-agent analysis\n\n{result}"
+        log.info("spawn_agent: response received")
+        return result
     except Exception as e:
         log.error(f"spawn_agent LLM call error: {e}", exc_info=True)
         return f"❌ Sub-agent call failed: {e}"
+
+
+async def _execute_write_file(args: dict) -> str:
+    """
+    Generate a file via a fresh sub-agent call, write it to disk, and
+    return a brief status string. The LLM context only sees the status —
+    never the file content — keeping the orchestrator context lean.
+    """
+    path   = args.get("path", "")
+    prompt = args.get("prompt", "")
+
+    if not path or not prompt:
+        return "❌ write-file: 'path' and 'prompt' are required"
+
+    if not _LLM_BASE or not _LLM_MODEL:
+        return "❌ write-file: LLM not configured (call set_llm_config first)"
+    if not SHELL_SERVER_URL:
+        return "❌ write-file: shell server not registered"
+
+    # ── Generate file content via sub-agent ───────────────────────────────────
+    system_instruction = (
+        "You are a code generation assistant. "
+        "Respond with ONLY the complete file contents — no preamble, "
+        "no explanation, no markdown fences. Raw code only."
+    )
+    log.info(f"write_file: generating {path!r} via sub-agent")
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                f"{_LLM_BASE}/v1/chat/completions",
+                json={
+                    "model": _LLM_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    "stream": False,
+                    "max_tokens": 8192,
+                },
+            )
+            data = resp.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        log.info(f"write_file: sub-agent returned {len(content)} chars")
+    except Exception as e:
+        log.error(f"write_file sub-agent error: {e}", exc_info=True)
+        return f"❌ write-file: sub-agent call failed: {e}"
+
+    # Strip any accidental markdown fences the model may have added
+    fence_m = re.search(r'^```[^\n]*\n(.*?)^```\s*$', content, re.DOTALL | re.MULTILINE)
+    if fence_m:
+        content = fence_m.group(1)
+        log.debug("write_file: stripped markdown fences from output")
+
+    # ── Write to disk via shell_server ────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{SHELL_SERVER_URL}/write_file",
+                json={"path": path, "content": content},
+            )
+            r = resp.json()
+        if not r.get("ok"):
+            return f"❌ write-file: could not write {path}: {r.get('error', 'unknown')}"
+        n_lines = r.get("lines", content.count("\n") + 1)
+        log.info(f"write_file: wrote {path!r} ({n_lines} lines)")
+    except Exception as e:
+        log.error(f"write_file disk write error: {e}", exc_info=True)
+        return f"❌ write-file: disk write failed: {e}"
+
+    # Return a terse status — content never enters the orchestrator context
+    preview = "\n".join(content.splitlines()[:8])
+    return (
+        f"File written: `{path}` ({n_lines} lines). "
+        f"Verify implementation with spawn-agent.\n\n"
+        f"```\n{preview}\n{'...' if n_lines > 8 else ''}\n```"
+    )
 
 
 # ── dot-command dispatcher ────────────────────────────────────────────────────

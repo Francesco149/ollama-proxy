@@ -33,12 +33,15 @@ AUTORUN_ENABLED = autorun_cfg.get("enabled", False)
 AUTORUN_MAX_ITER = autorun_cfg.get("max_iterations", 10)
 AUTORUN_MAX_FAILURES = autorun_cfg.get("max_consecutive_failures", 3)
 
+session_cfg = config.get("session", {})
+SESSION_PERSIST_PATH = session_cfg.get("persist_path", None)
+
 REAL_MODEL = None
 
 # ── app + singletons ──────────────────────────────────────────────────────────
 
 app = FastAPI()
-session_manager = SessionManager()
+session_manager = SessionManager(persist_path=SESSION_PERSIST_PATH)
 skill_engine = SkillEngine(session_manager)
 
 # ── startup ───────────────────────────────────────────────────────────────────
@@ -197,32 +200,37 @@ async def chat(request: Request):
         return await handle_non_streaming_chat(openai_body, MODEL_NAME, LLAMA_BASE, execute_tool)
 
     if AUTORUN_ENABLED:
-        session_id = session_manager.get_session_id(messages)
         oai_messages = openai_body["messages"]  # already OpenAI-format
 
-        if session_manager.has_clean_context(session_id):
-            # Subsequent turn: append only the new user message to the clean
-            # context, ignoring Open WebUI's display-polluted full history.
+        # context_key: hash of PRIOR user messages (parent state).
+        # next_key:    hash of ALL user messages including this one.
+        # Branching is automatic: editing any prior message changes ctx_key,
+        # landing on a different (or absent) parent → new branch seeded.
+        ctx_key  = session_manager.context_key(oai_messages)
+        next_key = session_manager.next_context_key(oai_messages)
+
+        if session_manager.has_clean_context(ctx_key):
+            # Parent context found — append only the incoming user message,
+            # ignoring Open WebUI's display-polluted full history.
             new_user = next((m for m in reversed(oai_messages) if m["role"] == "user"), None)
             if new_user:
-                session_manager.append_clean(session_id, new_user)
-            context_messages = session_manager.get_clean_messages(session_id)
-            log.info(f"session {session_id}: resuming clean context ({len(context_messages)} messages)")
+                session_manager.append_clean(ctx_key, new_user)
+            context_messages = session_manager.get_clean_messages(ctx_key)
+            log.info(f"resuming context {ctx_key} ({len(context_messages)} messages)")
+        elif session_manager.has_clean_context(next_key):
+            # Exact state already stored (post-restart replay).
+            context_messages = session_manager.get_clean_messages(next_key)
+            log.info(f"exact context {next_key} found ({len(context_messages)} messages)")
         else:
-            # First turn: seed the clean context with the full incoming messages
-            # (includes skill-engine system prompt + user message).
-            session_manager.init_clean_context(session_id, oai_messages)
+            # New session or new branch — seed from full incoming messages.
+            session_manager.init_clean_context(next_key, oai_messages)
             context_messages = oai_messages
-            log.info(f"session {session_id}: new session, seeding clean context")
+            log.info(f"new context {next_key} seeded ({len(oai_messages)} messages)")
 
         openai_body = {**openai_body, "messages": context_messages}
 
         def on_clean_turn(assistant_content: str, command_output: str | None) -> None:
-            """
-            Persist each clean agentic iteration to the shadow context.
-            Called by auto_runner with the raw prose (no display artifacts)
-            and the plain-text command result (or None on clean finish).
-            """
+            """Persist each clean agentic iteration under next_key."""
             turns = [{"role": "assistant", "content": assistant_content}]
             if command_output is not None:
                 turns.append({
@@ -232,8 +240,8 @@ async def chat(request: Request):
                         "Continue based on the above output."
                     ),
                 })
-            session_manager.append_clean(session_id, *turns)
-            log.debug(f"session {session_id}: persisted clean turn "
+            session_manager.append_clean(next_key, *turns)
+            log.debug(f"context {next_key}: persisted "
                       f"({'with output' if command_output else 'final'})")
 
         return StreamingResponse(

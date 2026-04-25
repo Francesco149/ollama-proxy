@@ -141,3 +141,21 @@ async def startup():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+class WriteFileRequest(BaseModel):
+    path: str
+    content: str
+
+@app.post("/write_file")
+async def write_file(request: WriteFileRequest):
+    log.info(f"[shell] writing file: {request.path}")
+    try:
+        p = Path(request.path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(request.content, encoding="utf-8")
+        lines = request.content.count("\n") + (1 if request.content else 0)
+        return {"ok": True, "path": request.path, "lines": lines}
+    except Exception as e:
+        log.error(f"[shell] write_file error: {e}")
+        return {"ok": False, "error": str(e)}
