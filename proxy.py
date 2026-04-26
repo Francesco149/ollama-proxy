@@ -216,6 +216,10 @@ async def chat(request: Request):
             if new_user:
                 session_manager.append_clean(ctx_key, new_user)
             context_messages = session_manager.get_clean_messages(ctx_key)
+            # Seed next_key from ctx_key NOW so on_clean_turn can append to it.
+            # Without this, append_clean(next_key) silently no-ops and the
+            # following turn falls back to Open WebUI's polluted display history.
+            session_manager.register_next(ctx_key, next_key)
             log.info(f"resuming context {ctx_key} ({len(context_messages)} messages)")
         elif session_manager.has_clean_context(next_key):
             # Exact state already stored (post-restart replay).
