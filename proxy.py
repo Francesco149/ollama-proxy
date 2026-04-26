@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from vision_module import to_openai_messages
-from tool_manager import TOOLS, execute_tool, set_shell_url, set_llm_config, process_manual_command
+from tool_manager import TOOLS, execute_tool, set_shell_url, set_llm_config, set_context_provider, process_manual_command
 from auto_runner import run_agentic_chat
 from session_manager import SessionManager
 from skill_engine import SkillEngine
@@ -35,6 +35,13 @@ AUTORUN_MAX_FAILURES = autorun_cfg.get("max_consecutive_failures", 3)
 
 session_cfg = config.get("session", {})
 SESSION_PERSIST_PATH = session_cfg.get("persist_path", None)
+
+tools_ctx_cfg = config.get("tools", {}).get("context", {})
+TOOL_CONTEXT_MODES = {
+    k: v for k, v in tools_ctx_cfg.items()
+    if k in ("spawn_agent", "write_file", "patch_file", "run_test")
+}
+TOOL_CONTEXT_MAX_MESSAGES = tools_ctx_cfg.get("max_messages", 20)
 
 REAL_MODEL = None
 
@@ -208,6 +215,14 @@ async def chat(request: Request):
         # landing on a different (or absent) parent → new branch seeded.
         ctx_key  = session_manager.context_key(oai_messages)
         next_key = session_manager.next_context_key(oai_messages)
+
+        # Register context provider for this request — lazily returns the
+        # live shadow context so sub-agents always see fully up-to-date turns.
+        set_context_provider(
+            provider=lambda: session_manager.get_clean_messages(next_key),
+            modes=TOOL_CONTEXT_MODES if TOOL_CONTEXT_MODES else None,
+            max_messages=TOOL_CONTEXT_MAX_MESSAGES,
+        )
 
         if session_manager.has_clean_context(ctx_key):
             # Parent context found — append only the incoming user message,

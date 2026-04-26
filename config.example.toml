@@ -27,3 +27,19 @@ max_consecutive_failures = 3
 # a new branch with no stale history.
 # Omit or leave empty to disable persistence (in-memory only).
 persist_path = "/opt/ai-lab/ollama-proxy/sessions.json"
+
+[tools.context]
+# How much of the current conversation to inject into sub-agent calls.
+# Per-tool: "none" | "full" | "summarize"
+#
+# none      — sub-agent sees only files + instruction (current default)
+# full      — sub-agent gets the last max_messages turns of clean context
+# summarize — one extra LLM call produces a ~150-word handoff first;
+#             useful for write_file where full history would be noisy
+spawn_agent = "none"
+write_file  = "summarize"
+patch_file  = "full"
+run_test    = "none"
+
+# Max conversation turns to include in "full" mode (most recent N)
+max_messages = 20

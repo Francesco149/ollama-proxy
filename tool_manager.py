@@ -12,6 +12,22 @@ _LLM_MODEL: str | None = None
 
 _ingest_sem = asyncio.Semaphore(2)
 
+# Context provider — set per-request by proxy.py
+# Returns the clean shadow-context message list for the current session.
+# None means no context injection is configured.
+_context_provider: "Callable[[], list[dict]] | None" = None
+
+# Per-tool context mode: "none" | "full" | "summarize"
+_tool_context_modes: dict[str, str] = {
+    "spawn_agent": "none",
+    "write_file":  "summarize",
+    "patch_file":  "full",
+    "run_test":    "none",
+}
+
+# Max messages to include in "full" mode (last N, excluding role=tool)
+_context_max_messages: int = 20
+
 RE_SHELL = re.compile(r'<run-shell>(.*?)</run-shell>', re.DOTALL)
 RE_PYTHON = re.compile(r'<run-python>(.*?)</run-python>', re.DOTALL)
 
@@ -28,6 +44,28 @@ def set_llm_config(llm_base: str, llm_model: str) -> None:
     _LLM_BASE = llm_base
     _LLM_MODEL = llm_model
     log.info(f"LLM config set: base={llm_base} model={llm_model}")
+
+
+def set_context_provider(
+    provider: "Callable[[], list[dict]] | None",
+    modes: dict[str, str] | None = None,
+    max_messages: int = 20,
+) -> None:
+    """
+    Register a lazy context provider for the current request.
+
+    provider: callable that returns the clean shadow-context message list.
+              Called lazily at tool-execution time so it includes all turns
+              up to and including the current one.
+    modes:    per-tool override map {"tool_name": "none"|"full"|"summarize"}.
+              Merges with defaults — only keys present are overridden.
+    """
+    global _context_provider, _tool_context_modes, _context_max_messages
+    _context_provider = provider
+    _context_max_messages = max_messages
+    if modes:
+        _tool_context_modes.update(modes)
+    log.debug(f"context provider set, modes={_tool_context_modes}")
 
 # ── tool schemas ──────────────────────────────────────────────────────────────
 
@@ -148,6 +186,71 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_test",
+            "description": (
+                "Write a Python test script to /tmp, execute it, and return the output. "
+                "Use to confirm or deny a hypothesis about runtime behaviour before "
+                "touching production code. The script runs in the sandbox and is deleted "
+                "after execution — it never touches the project tree."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hypothesis": {
+                        "type": "string",
+                        "description": (
+                            "One-sentence statement of what you expect to be true or false. "
+                            "Prepended as a comment so the output is self-documenting."
+                        ),
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Complete, self-contained Python script that proves or disproves "
+                            "the hypothesis. May import from the project — the project dir "
+                            "is on sys.path inside the sandbox."
+                        ),
+                    },
+                },
+                "required": ["hypothesis", "code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": (
+                "Apply a surgical edit to an existing file without loading it into context. "
+                "A sub-agent receives the file + instruction and produces a unified diff; "
+                "the proxy applies it with patch(1). Returns the resulting git diff on "
+                "success so you can verify the change. Retries once on apply failure. "
+                "Use instead of aider for targeted single-function edits."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to patch.",
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": (
+                            "Precise edit instruction for the sub-agent. Include: "
+                            "exact function name, what currently happens, what should "
+                            "happen instead, any variable names or API calls involved. "
+                            "The more specific, the cleaner the diff."
+                        ),
+                    },
+                },
+                "required": ["path", "instruction"],
+            },
+        },
+    },
 ]
 
 # ── tool execution ────────────────────────────────────────────────────────────
@@ -169,6 +272,12 @@ async def execute_tool(name: str, args: dict) -> str:
 
     if name == "write_file":
         return await _execute_write_file(args)
+
+    if name == "run_test":
+        return await _execute_run_test(args)
+
+    if name == "patch_file":
+        return await _execute_patch_file(args)
 
     return f"Unknown tool: {name}"
 
@@ -266,6 +375,77 @@ async def _execute_python(args: dict) -> str:
         log.error(f"run_python exception: {e}", exc_info=True)
         return f"Error executing python code: {e}"
 
+async def _build_context_messages(tool_name: str) -> list[dict]:
+    """
+    Build the message history to prepend to a sub-agent call.
+
+    Mode "none"      — empty list (no context injected)
+    Mode "full"      — last _context_max_messages assistant+user turns
+                       from the shadow context. role=tool messages are
+                       excluded: they are raw stdout/file content that
+                       bloats the prompt without helping the sub-agent.
+    Mode "summarize" — single separate LLM call that condenses the session
+                       into a concise handoff paragraph, then wraps it as
+                       a user message. Costs one extra round-trip but
+                       produces focused context even from long sessions.
+    """
+    mode = _tool_context_modes.get(tool_name, "none")
+    if mode == "none" or _context_provider is None:
+        return []
+
+    raw = _context_provider()  # full clean shadow context
+    # Filter to prose turns only — exclude role=tool (raw results)
+    prose = [m for m in raw if m.get("role") in ("user", "assistant")]
+
+    if mode == "full":
+        kept = prose[-_context_max_messages:]
+        log.debug(f"context full: {len(kept)} messages for {tool_name}")
+        return kept
+
+    if mode == "summarize":
+        if not prose:
+            return []
+        # Build a flat transcript for the summariser
+        lines = []
+        for m in prose[-_context_max_messages:]:
+            role = m.get("role", "")
+            txt  = m.get("content") or ""
+            if isinstance(txt, list):          # multi-part content
+                txt = " ".join(p.get("text", "") for p in txt if p.get("type") == "text")
+            lines.append(f"[{role}]: {txt[:400]}")
+        transcript = "\n".join(lines)
+
+        summarise_prompt = (
+            "You are preparing a handoff for a coding sub-agent. "
+            "Given the conversation below, write a concise handoff (≤150 words) covering:\n"
+            "- Project and module being worked on\n"
+            "- Relevant structure discovered (function names, file paths, patterns)\n"
+            "- The specific task that needs to happen next\n"
+            "- Any constraints or conventions that apply\n\n"
+            "Be specific. Include file paths, function names, variable names where known.\n\n"
+            f"Conversation:\n{transcript}"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{_LLM_BASE}/v1/chat/completions",
+                    json={
+                        "model":      _LLM_MODEL,
+                        "messages":   [{"role": "user", "content": summarise_prompt}],
+                        "stream":     False,
+                        "max_tokens": 300,
+                    },
+                )
+                summary = resp.json()["choices"][0]["message"]["content"].strip()
+            log.debug(f"context summarize: {len(summary)} chars for {tool_name}")
+            return [{"role": "user", "content": f"Session context:\n{summary}"}]
+        except Exception as e:
+            log.warning(f"context summarize failed: {e} — falling back to none")
+            return []
+
+    return []
+
+
 async def _read_file_via_shell(path: str) -> tuple[str, str | None]:
     """Read a file via shell_server. Returns (content, error_or_None)."""
     try:
@@ -323,14 +503,16 @@ async def _execute_spawn_agent(args: dict) -> str:
     parts.append(prompt)
     user_content = "\n\n".join(parts)
 
-    log.info(f"spawn_agent: calling sub-agent, {len(all_paths)} file(s), prompt_len={len(user_content)}")
+    ctx_messages = await _build_context_messages("spawn_agent")
+    messages = ctx_messages + [{"role": "user", "content": user_content}]
+    log.info(f"spawn_agent: {len(all_paths)} file(s), prompt_len={len(user_content)}, ctx={len(ctx_messages)}")
     try:
         async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(
                 f"{_LLM_BASE}/v1/chat/completions",
                 json={
                     "model": _LLM_MODEL,
-                    "messages": [{"role": "user", "content": user_content}],
+                    "messages": messages,
                     "stream": False,
                     "max_tokens": 2048,
                 },
@@ -367,17 +549,19 @@ async def _execute_write_file(args: dict) -> str:
         "Respond with ONLY the complete file contents — no preamble, "
         "no explanation, no markdown fences. Raw code only."
     )
-    log.info(f"write_file: generating {path!r} via sub-agent")
+    ctx_messages = await _build_context_messages("write_file")
+    # Context goes between system instruction and the generation prompt
+    messages = [{"role": "system", "content": system_instruction}]
+    messages += ctx_messages
+    messages += [{"role": "user", "content": prompt}]
+    log.info(f"write_file: generating {path!r}, ctx={len(ctx_messages)}")
     try:
         async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(
                 f"{_LLM_BASE}/v1/chat/completions",
                 json={
                     "model": _LLM_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user",   "content": prompt},
-                    ],
+                    "messages": messages,
                     "stream": False,
                     "max_tokens": 8192,
                 },
@@ -418,6 +602,124 @@ async def _execute_write_file(args: dict) -> str:
         f"Verify implementation with spawn-agent.\n\n"
         f"```\n{preview}\n{'...' if n_lines > 8 else ''}\n```"
     )
+
+
+async def _execute_run_test(args: dict) -> str:
+    """Write a hypothesis + test script to /tmp in the sandbox, run it, clean up."""
+    code       = args.get("code", "")
+    hypothesis = args.get("hypothesis", "")
+
+    if not code:
+        return "❌ run_test: 'code' is required"
+    if not SHELL_SERVER_URL:
+        return "❌ run_test: shell server not registered"
+
+    log.info(f"run_test: hypothesis={hypothesis[:60]!r}")
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{SHELL_SERVER_URL}/run_test",
+                json={"code": code, "hypothesis": hypothesis},
+            )
+            r = resp.json()
+        stdout = r.get("stdout", "")
+        stderr = r.get("stderr", "")
+        code_val = r.get("exit_code", -1)
+        parts = []
+        if hypothesis:
+            parts.append("**Hypothesis:** " + hypothesis)
+        if stdout:
+            parts.append("**stdout:**\n``````\n" + stdout + "\n``````")
+        if stderr:
+            parts.append("**stderr:**\n``````\n" + stderr + "\n``````")
+        parts.append(f"**exit code:** `{code_val}`")
+        return "\n\n".join(parts)
+    except Exception as e:
+        log.error(f"run_test error: {e}", exc_info=True)
+        return f"❌ run_test failed: {e}"
+
+
+async def _execute_patch_file(args: dict, _retry: bool = False) -> str:
+    """
+    Sub-agent produces a unified diff for the given instruction;
+    shell_server applies it with patch(1). Retries once on failure.
+    """
+    path        = args.get("path", "")
+    instruction = args.get("instruction", "")
+
+    if not path or not instruction:
+        return "❌ patch_file: 'path' and 'instruction' are required"
+    if not _LLM_BASE or not _LLM_MODEL:
+        return "❌ patch_file: LLM not configured"
+    if not SHELL_SERVER_URL:
+        return "❌ patch_file: shell server not registered"
+
+    # Read the file via shell_server
+    file_content, err = await _read_file_via_shell(path)
+    if err:
+        return err
+
+    system = (
+        "You are a code patching assistant. "
+        "Produce ONLY a valid unified diff (output of `diff -u`) that applies the requested change. "
+        "No explanation, no markdown fences, no preamble. Raw diff only."
+    )
+    user = (
+        f"File: {path}\n\n"
+        f"<file>\n{file_content}\n</file>\n\n"
+        f"Instruction: {instruction}"
+    )
+
+    ctx_messages = await _build_context_messages("patch_file")
+    messages = [{"role": "system", "content": system}]
+    messages += ctx_messages
+    messages += [{"role": "user", "content": user}]
+    log.info(f"patch_file: generating diff for {path!r}, ctx={len(ctx_messages)}")
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                f"{_LLM_BASE}/v1/chat/completions",
+                json={
+                    "model":      _LLM_MODEL,
+                    "messages":   messages,
+                    "stream":     False,
+                    "max_tokens": 4096,
+                },
+            )
+            diff_text = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.error(f"patch_file sub-agent error: {e}", exc_info=True)
+        return f"❌ patch_file: diff generation failed: {e}"
+
+    # Strip accidental markdown fences
+    fence_m = re.search(r'(?m)^```[^\n]*\n(.*?)^```\s*$', diff_text, re.DOTALL)
+    if fence_m:
+        diff_text = fence_m.group(1)
+
+    log.info(f"patch_file: applying diff ({len(diff_text)} chars)")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{SHELL_SERVER_URL}/patch_file",
+                json={"path": path, "diff": diff_text},
+            )
+            r = resp.json()
+    except Exception as e:
+        return f"❌ patch_file: apply request failed: {e}"
+
+    if r.get("ok"):
+        result_diff = r.get("diff", "")
+        log.info(f"patch_file: success for {path!r}")
+        return (
+            f"Patch applied to `{path}`.\n\n"
+            f"**Resulting diff:**\n``````diff\n{result_diff}\n``````"
+        )
+
+    if not _retry:
+        log.warning(f"patch_file: first attempt failed ({r.get('error')}), retrying")
+        return await _execute_patch_file(args, _retry=True)
+
+    return f"❌ patch_file: apply failed after retry: {r.get('error', 'unknown')}"
 
 
 # ── dot-command dispatcher ────────────────────────────────────────────────────

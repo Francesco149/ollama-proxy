@@ -98,6 +98,23 @@ def _params_block(tool_name: str, args: dict) -> str:
         summary = f"{icon}  {path}"
         body = f"**Path:** `{path}`\n\n**Prompt:** {prompt}"
 
+    elif tool_name == "run_test":
+        hyp  = args.get("hypothesis", "")
+        code = args.get("code", "")
+        first = code.strip().split("\n")[0][:80]
+        summary = f"🧪  {hyp[:80]}" if hyp else f"🧪  {first}"
+        body_parts = []
+        if hyp:
+            body_parts.append(f"**Hypothesis:** {hyp}")
+        body_parts.append(f"**Code:**\n\n{_fenced(code)}")
+        body = "\n\n".join(body_parts)
+
+    elif tool_name == "patch_file":
+        path        = args.get("path", "")
+        instruction = args.get("instruction", "")
+        summary = f"🩹  {path.split('/')[-1]}"
+        body = f"**Path:** `{path}`\n\n**Instruction:** {instruction}"
+
     else:
         summary = f"▶  {tool_name}"
         body = _fenced(json.dumps(args, indent=2))
@@ -133,6 +150,20 @@ def _result_block(tool_name: str, args: dict, result: str) -> str:
         file_preview = preview_m.group(1) if preview_m else ""
         preview = f"📝 {path} — {n_lines} lines"
         body = f"**Path:** `{path}`\n\n**Preview:**\n\n{_fenced(file_preview)}" if file_preview else result
+
+    elif tool_name == "run_test":
+        preview = _strip_preview(result)
+        code_val = _exit_code(result)
+        icon = "✓ 🧪" if code_val == 0 else "✗ 🧪"
+        summary = f"{icon}  {preview}"
+        return _details(summary, result)
+
+    elif tool_name == "patch_file":
+        if result.startswith("Patch applied"):
+            summary = f"🩹  ✓  {args.get('path','').split('/')[-1]}"
+        else:
+            summary = f"🩹  ✗  {args.get('path','').split('/')[-1]}"
+        return _details(summary, result)
 
     else:
         body = _fenced(result)

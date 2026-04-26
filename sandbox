@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# sandbox — run the ollama-proxy shell-server inside a Docker container
+# mounted on the current project directory.
+#
+# Usage:
+#   sandbox                   # start (blocking, Ctrl-C to stop)
+#   sandbox build             # rebuild the Docker image
+#   sandbox stop              # stop any running sandbox container
+#
+# The shell-server inside the container registers itself with the proxy
+# at PROXY_URL (default http://host.docker.internal:11434).
+# Set PROXY_URL in your environment to override.
+#
+# File permissions: container runs as the current host user so all writes
+# have the same UID/GID as you — no root-owned files in the project.
+
+set -euo pipefail
+
+IMAGE="ollama-proxy-sandbox"
+CONTAINER="ollama-proxy-sandbox-run"
+PROXY_URL="${PROXY_URL:-http://host.docker.internal:11434}"
+SHELL_PORT="${SHELL_PORT:-8000}"
+
+# Locate the ollama-proxy directory (where this script lives).
+# shell_server.py is always mounted from here, read-only, regardless of
+# which project directory is active — so sandbox works from any project.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The project to mount is wherever the user ran sandbox from.
+PROJECT_DIR="$(pwd)"
+
+build() {
+    echo "[sandbox] Building image ${IMAGE}..."
+    docker build -t "${IMAGE}" "${SCRIPT_DIR}"
+    echo "[sandbox] Build complete."
+}
+
+stop_existing() {
+    if docker ps -q --filter "name=${CONTAINER}" | grep -q .; then
+        echo "[sandbox] Stopping existing container..."
+        docker rm -f "${CONTAINER}" >/dev/null
+    fi
+}
+
+start() {
+    stop_existing
+
+    # Auto-build if image doesn't exist
+    if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+        build
+    fi
+
+    echo "[sandbox] Starting sandbox"
+    echo "  Project : ${PROJECT_DIR}"
+    echo "  Proxy   : ${PROXY_URL}"
+    echo "  Port    : ${SHELL_PORT}"
+
+    # Mounts:
+    #   PROJECT_DIR — read-write, at real path so git/imports work
+    #   SCRIPT_DIR  — read-only, so shell_server.py is always reachable
+    #                 even when running from a different project dir
+    #
+    # Note: do NOT mount /opt/venv from the host — the venv is baked
+    # into the image. Mounting would shadow it with whatever (possibly
+    # empty) host path exists.
+    EXTRA_MOUNT=""
+    if [ "${SCRIPT_DIR}" != "${PROJECT_DIR}" ]; then
+        EXTRA_MOUNT="-v ${SCRIPT_DIR}:${SCRIPT_DIR}:ro"
+    fi
+
+    docker run --rm \
+        --name "${CONTAINER}" \
+        --user "$(id -u):$(id -g)" \
+        --add-host host.docker.internal:host-gateway \
+        -e PROXY_URL="${PROXY_URL}" \
+        -v "${PROJECT_DIR}:${PROJECT_DIR}" \
+        ${EXTRA_MOUNT} \
+        -p "${SHELL_PORT}:8000" \
+        -w "${PROJECT_DIR}" \
+        "${IMAGE}" \
+        python3 "${SCRIPT_DIR}/shell_server.py"
+}
+
+case "${1:-start}" in
+    build)  build ;;
+    stop)   stop_existing; echo "[sandbox] Stopped." ;;
+    start)  start ;;
+    *)      echo "Usage: sandbox [start|stop|build]"; exit 1 ;;
+esac
