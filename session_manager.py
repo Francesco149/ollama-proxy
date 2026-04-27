@@ -213,10 +213,12 @@ class SessionManager:
         return list(self._store.get(key, {}).get("messages", []))
 
     def init_clean_context(self, key: str, messages: list[dict]) -> None:
-        entry = self._store.setdefault(key, {"skills": [], "doc": dict(_EMPTY_DOC)})
+        entry = self._store.setdefault(key, {"skills": [], "doc": dict(_EMPTY_DOC), "stuck": {}})
         entry["messages"] = list(messages)
         if "doc" not in entry:
             entry["doc"] = dict(_EMPTY_DOC)
+        if "stuck" not in entry:
+            entry["stuck"] = {}
         log.info(f"context {key}: initialised ({len(messages)} messages)")
         self._save()
 
@@ -289,6 +291,21 @@ class SessionManager:
 
     def get_doc_rendered(self, key: str) -> str:
         return render_working_doc(self.get_doc(key))
+
+    # ── stuck detector state ─────────────────────────────────────────────────
+
+    def get_stuck_state(self, key: str) -> dict:
+        """Return the persisted stuck detector state for this context key."""
+        return dict(self._store.get(key, {}).get("stuck", {}))
+
+    def save_stuck_state(self, key: str, state: dict) -> None:
+        """Persist stuck detector state after each request."""
+        if key not in self._store:
+            return
+        if "stuck" not in self._store[key]:
+            self._store[key]["stuck"] = {}
+        self._store[key]["stuck"] = dict(state)
+        self._save()
 
     # ── persistence ───────────────────────────────────────────────────────────
 

@@ -185,13 +185,38 @@ _STUCK_NUDGE = (
 
 
 class StuckDetector:
-    def __init__(self, repeat_threshold: int = 2, empty_threshold: int = 2):
+    """
+    Tracks repeated identical tool calls and empty turns across requests.
+    State is serialisable so it can be persisted in session_manager and
+    restored on the next HTTP request — preventing the reset-each-turn bug
+    where the detector never accumulates enough repeat count to fire.
+    """
+    def __init__(
+        self,
+        repeat_threshold: int = 1,
+        empty_threshold: int = 1,
+        state: dict | None = None,
+    ):
         self.repeat_threshold = repeat_threshold
         self.empty_threshold  = empty_threshold
-        self._last_call: str | None = None
-        self._repeat_count   = 0
-        self._empty_count    = 0
-        self._nudge_sent     = False
+        if state:
+            self._last_call    = state.get("last_call")
+            self._repeat_count = state.get("repeat_count", 0)
+            self._empty_count  = state.get("empty_count", 0)
+            self._nudge_sent   = state.get("nudge_sent", False)
+        else:
+            self._last_call: str | None = None
+            self._repeat_count   = 0
+            self._empty_count    = 0
+            self._nudge_sent     = False
+
+    def to_dict(self) -> dict:
+        return {
+            "last_call":    self._last_call,
+            "repeat_count": self._repeat_count,
+            "empty_count":  self._empty_count,
+            "nudge_sent":   self._nudge_sent,
+        }
 
     def record_tool_call(self, name: str, args: dict) -> bool:
         """Return True if this looks like a stuck repeat."""
@@ -306,19 +331,22 @@ async def run_agentic_chat(
     max_consecutive_failures: int = 3,
     on_clean_turn: Callable[[str, list | None], None] | None = None,
     working_doc_system_msg: dict | None = None,
+    stuck_state: dict | None = None,
+    on_stuck_state: Callable[[dict], None] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Agentic loop with working document, stuck detection, and arg validation.
 
-    working_doc_system_msg: if provided, prepended to messages each iteration
-      so the model always sees the current document state.
-
-    on_clean_turn(assistant_content, tool_results_or_None): called after each
-      complete iteration for shadow context persistence and eviction.
+    stuck_state: serialised StuckDetector state from previous request.
+      Persisting across requests prevents the reset-each-turn bug.
+    on_stuck_state: called after each iteration with the current stuck state
+      dict so the caller can persist it.
+    working_doc_system_msg: prepended to messages each iteration.
+    on_clean_turn: called after each iteration for shadow context persistence.
     """
     messages = list(openai_body["messages"])
     consecutive_failures = 0
-    stuck = StuckDetector()
+    stuck = StuckDetector(repeat_threshold=1, empty_threshold=1, state=stuck_state)
 
     for iteration in range(max_iterations):
         log.info(f"iteration {iteration}, messages={len(messages)}")
@@ -359,6 +387,8 @@ async def run_agentic_chat(
                 if stuck.record_empty_turn() and stuck.should_nudge():
                     log.warning(f"iteration {iteration}: empty turn, injecting nudge")
                     stuck.mark_nudged()
+                    if on_stuck_state:
+                        on_stuck_state(stuck.to_dict())
                     nudge_msg = {"role": "user", "content": _STUCK_NUDGE}
                     messages.append({"role": "assistant", "content": prose})
                     messages.append(nudge_msg)
@@ -366,6 +396,8 @@ async def run_agentic_chat(
             log.info(f"iteration {iteration}: clean finish")
             if on_clean_turn:
                 on_clean_turn(prose, None)
+            if on_stuck_state:
+                on_stuck_state(stuck.to_dict())
             yield _make_chunk(model_name, "", done=True)
             return
 
@@ -381,16 +413,18 @@ async def run_agentic_chat(
             args    = tc["args"]
             call_id = tc["id"]
 
-            # update_document is handled inline — no execute_tool_fn needed
-            if name == "update_document":
-                is_update_doc = True
-                yield _make_chunk(model_name, _params_block(name, args))
-                result = await execute_tool_fn(name, args)  # calls _execute_update_document
-                yield _make_chunk(model_name, _result_block(name, args, result))
-                tool_results.append({"tool_call_id": call_id, "name": name, "result": result})
+            # ── 1. stuck detection — runs first, before anything else ─────────
+            # Placed first so it fires regardless of whether args are valid.
+            # An empty repeated call is just as stuck as a valid repeated one.
+            if stuck.record_tool_call(name, args) and stuck.should_nudge():
+                log.warning(f"iteration {iteration}: stuck on {name}, injecting nudge")
+                stuck.mark_nudged()
+                nudge = f"[Stuck: {_STUCK_NUDGE}]"
+                yield _make_chunk(model_name, f"\n\n⚠️ {_STUCK_NUDGE}\n\n")
+                tool_results.append({"tool_call_id": call_id, "name": name, "result": nudge})
                 continue
 
-            # Validate args before executing anything
+            # ── 2. arg validation ────────────────────────────────────────────
             err = validate_tool_args(name, args)
             if err:
                 log.warning(f"iteration {iteration}: {name} bad args: {err}")
@@ -399,26 +433,22 @@ async def run_agentic_chat(
                 had_failure = True
                 continue
 
-            # Stuck detection
-            if stuck.record_tool_call(name, args) and stuck.should_nudge():
-                log.warning(f"iteration {iteration}: stuck on {name}, injecting nudge")
-                stuck.mark_nudged()
-                yield _make_chunk(model_name, f"\n\n⚠️ {_STUCK_NUDGE}\n\n")
-                tool_results.append({
-                    "tool_call_id": call_id,
-                    "name": name,
-                    "result": f"[Stuck detected — {_STUCK_NUDGE}]",
-                })
+            # ── 3. update_document — inline, no network ──────────────────────
+            if name == "update_document":
+                is_update_doc = True
+                yield _make_chunk(model_name, _params_block(name, args))
+                result = await execute_tool_fn(name, args)
+                yield _make_chunk(model_name, _result_block(name, args, result))
+                tool_results.append({"tool_call_id": call_id, "name": name, "result": result})
                 continue
 
+            # ── 4. all other tools ───────────────────────────────────────────
             log.info(f"iteration {iteration}: {name} args_keys={list(args)}")
 
-            # Params block — yield immediately before execution
             yield _make_chunk(model_name, _params_block(name, args))
 
             result = await execute_tool_fn(name, args)
 
-            # Track failures for shell/python
             if name in ("run_shell", "run_python"):
                 code = _exit_code(result)
                 if (code or 0) != 0:
@@ -445,9 +475,11 @@ async def run_agentic_chat(
             yield _make_chunk(model_name, "", done=True)
             return
 
-        # ── persist clean turn ────────────────────────────────────────────────
+        # ── persist clean turn + stuck state ─────────────────────────────────
         if on_clean_turn:
             on_clean_turn(prose, tool_results)
+        if on_stuck_state:
+            on_stuck_state(stuck.to_dict())
 
         # ── inject into message history ───────────────────────────────────────
         messages.append({

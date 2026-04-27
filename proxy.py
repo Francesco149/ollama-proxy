@@ -296,6 +296,11 @@ async def chat(request: Request):
                 f"({'tools' if tool_results else 'final'})"
             )
 
+        stuck_state = session_manager.get_stuck_state(next_key)
+
+        def on_stuck_state(state: dict) -> None:
+            session_manager.save_stuck_state(next_key, state)
+
         return StreamingResponse(
             run_agentic_chat(
                 openai_body,
@@ -306,6 +311,8 @@ async def chat(request: Request):
                 max_consecutive_failures=AUTORUN_MAX_FAILURES,
                 on_clean_turn=on_clean_turn,
                 working_doc_system_msg=working_doc_msg,
+                stuck_state=stuck_state,
+                on_stuck_state=on_stuck_state,
             ),
             media_type="application/x-ndjson",
         )
