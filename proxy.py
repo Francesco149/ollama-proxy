@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from vision_module import to_openai_messages
-from tool_manager import TOOLS, execute_tool, set_shell_url, set_llm_config, set_context_provider, process_manual_command
+from tool_manager import TOOLS, execute_tool, set_shell_url, set_llm_config, set_context_provider, set_doc_updater, process_manual_command
 from auto_runner import run_agentic_chat
 from session_manager import SessionManager
 from skill_engine import SkillEngine
@@ -42,6 +42,10 @@ TOOL_CONTEXT_MODES = {
     if k in ("spawn_agent", "write_file", "patch_file", "run_test")
 }
 TOOL_CONTEXT_MAX_MESSAGES = tools_ctx_cfg.get("max_messages", 20)
+
+ctx_cfg = config.get("context", {})
+EVICTION_KEEP_TURNS = ctx_cfg.get("eviction_keep_turns", 8)
+EVICTION_TOKEN_BUDGET = ctx_cfg.get("token_budget", 12000)
 
 REAL_MODEL = None
 
@@ -216,60 +220,53 @@ async def chat(request: Request):
         ctx_key  = session_manager.context_key(oai_messages)
         next_key = session_manager.next_context_key(oai_messages)
 
-        # Register context provider for this request — lazily returns the
-        # live shadow context so sub-agents always see fully up-to-date turns.
+        # ── context provider + doc updater (set before any tool executes) ───────
         set_context_provider(
             provider=lambda: session_manager.get_clean_messages(next_key),
             modes=TOOL_CONTEXT_MODES if TOOL_CONTEXT_MODES else None,
             max_messages=TOOL_CONTEXT_MAX_MESSAGES,
         )
+        set_doc_updater(
+            lambda section, doc_content: session_manager.update_doc_section(next_key, section, doc_content)
+        )
 
         if session_manager.has_clean_context(ctx_key):
-            # Parent context found — append only the incoming user message,
-            # ignoring Open WebUI's display-polluted full history.
             new_user = next((m for m in reversed(oai_messages) if m["role"] == "user"), None)
             if new_user:
                 session_manager.append_clean(ctx_key, new_user)
             context_messages = session_manager.get_clean_messages(ctx_key)
-            # Seed next_key from ctx_key NOW so on_clean_turn can append to it.
-            # Without this, append_clean(next_key) silently no-ops and the
-            # following turn falls back to Open WebUI's polluted display history.
             session_manager.register_next(ctx_key, next_key)
             log.info(f"resuming context {ctx_key} ({len(context_messages)} messages)")
         elif session_manager.has_clean_context(next_key):
-            # Exact state already stored (post-restart replay).
             context_messages = session_manager.get_clean_messages(next_key)
             log.info(f"exact context {next_key} found ({len(context_messages)} messages)")
         else:
-            # New session or new branch — seed from full incoming messages.
             session_manager.init_clean_context(next_key, oai_messages)
             context_messages = oai_messages
             log.info(f"new context {next_key} seeded ({len(oai_messages)} messages)")
 
+        # ── working document: always prepend current state ────────────────────
+        doc_content = session_manager.get_doc_rendered(next_key)
+        working_doc_msg = {
+            "role": "system",
+            "content": doc_content,
+            "_working_doc": True,  # marker so auto_runner can identify it
+        }
+        # Strip any prior working doc from context_messages, re-inject fresh
+        context_messages = [m for m in context_messages if not m.get("_working_doc")]
         openai_body = {**openai_body, "messages": context_messages}
 
         def on_clean_turn(
             assistant_content: str,
             tool_results: list | None,
         ) -> None:
-            """
-            Persist each clean agentic iteration under next_key.
-            Stores assistant prose + properly formatted role=tool turns so
-            the model sees correct multi-turn context on continuation.
-            """
-            import json as _json
             turns: list[dict] = []
-
             if tool_results:
-                # Reconstruct tool_calls array for the assistant message
                 tool_calls_arr = [
                     {
                         "id": tr["tool_call_id"],
                         "type": "function",
-                        "function": {
-                            "name": tr["name"],
-                            "arguments": "{}",  # args already executed; omit for brevity
-                        },
+                        "function": {"name": tr["name"], "arguments": "{}"},
                     }
                     for tr in tool_results
                 ]
@@ -288,9 +285,15 @@ async def chat(request: Request):
                 turns.append({"role": "assistant", "content": assistant_content})
 
             session_manager.append_clean(next_key, *turns)
+            # Evict stale turns to stay within budget
+            session_manager.evict(
+                next_key,
+                keep_turns=EVICTION_KEEP_TURNS,
+                token_budget=EVICTION_TOKEN_BUDGET,
+            )
             log.debug(
-                f"context {next_key}: persisted "
-                f"({len(tool_results)} tool(s)" if tool_results else "(final)"
+                f"context {next_key}: persisted + evicted "
+                f"({'tools' if tool_results else 'final'})"
             )
 
         return StreamingResponse(
@@ -302,6 +305,7 @@ async def chat(request: Request):
                 max_iterations=AUTORUN_MAX_ITER,
                 max_consecutive_failures=AUTORUN_MAX_FAILURES,
                 on_clean_turn=on_clean_turn,
+                working_doc_system_msg=working_doc_msg,
             ),
             media_type="application/x-ndjson",
         )

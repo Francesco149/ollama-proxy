@@ -12,6 +12,10 @@ _LLM_MODEL: str | None = None
 
 _ingest_sem = asyncio.Semaphore(2)
 
+# Document updater — set per-request by proxy.py
+# Callable[(section, content) -> bool] that writes to session_manager.
+_doc_updater: "Callable[[str, str], bool] | None" = None
+
 # Context provider — set per-request by proxy.py
 # Returns the clean shadow-context message list for the current session.
 # None means no context injection is configured.
@@ -44,6 +48,13 @@ def set_llm_config(llm_base: str, llm_model: str) -> None:
     _LLM_BASE = llm_base
     _LLM_MODEL = llm_model
     log.info(f"LLM config set: base={llm_base} model={llm_model}")
+
+
+def set_doc_updater(updater: "Callable[[str, str], bool] | None") -> None:
+    """Register a callable that writes Working Document sections for this request."""
+    global _doc_updater
+    _doc_updater = updater
+    log.debug("doc_updater registered")
 
 
 def set_context_provider(
@@ -222,6 +233,36 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "update_document",
+            "description": (
+                "Update a section of the Working Document. "
+                "Call this after every spawn_agent to record findings, after completing "
+                "each plan step to mark it [done], and whenever you discover a constraint "
+                "or decision. Keeping the document current is what allows old tool results "
+                "to be safely evicted from context. This is a lightweight local operation "
+                "— no file I/O, no network call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "section": {
+                        "type": "string",
+                        "enum": ["Project", "Task", "Scope", "Findings", "Plan",
+                                 "Decisions", "Open Questions"],
+                        "description": "Which section to update (replaces existing content).",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "New content for this section. Be concise — bullet points preferred.",
+                    },
+                },
+                "required": ["section", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "patch_file",
             "description": (
                 "Apply a surgical edit to an existing file without loading it into context. "
@@ -272,6 +313,9 @@ async def execute_tool(name: str, args: dict) -> str:
 
     if name == "write_file":
         return await _execute_write_file(args)
+
+    if name == "update_document":
+        return _execute_update_document(args)
 
     if name == "run_test":
         return await _execute_run_test(args)
@@ -374,6 +418,49 @@ async def _execute_python(args: dict) -> str:
     except Exception as e:
         log.error(f"run_python exception: {e}", exc_info=True)
         return f"Error executing python code: {e}"
+
+def _execute_update_document(args: dict) -> str:
+    """Synchronous — just updates in-memory state via the registered callback."""
+    section = args.get("section", "")
+    doc_content = args.get("content", "")
+    if not section:
+        return "❌ update_document: 'section' is required"
+    if _doc_updater is None:
+        return "❌ update_document: no doc_updater registered"
+    ok = _doc_updater(section, doc_content)
+    if ok:
+        return f"✓ Working Document [{section}] updated."
+    return f"❌ update_document: unknown section {section!r}. Valid: Project, Task, Scope, Findings, Plan, Decisions, Open Questions"
+
+
+def validate_tool_args(name: str, args: dict) -> str | None:
+    """
+    Return an error string if required args are missing or empty,
+    None if args look valid.
+
+    Catches the common failure mode where the model emits a tool call
+    with empty or null parameters — returns a structured error message
+    the model can self-correct from rather than executing a no-op.
+    """
+    required: dict[str, list[str]] = {
+        "run_shell":       ["command"],
+        "run_python":      ["code"],
+        "spawn_agent":     ["prompt"],
+        "write_file":      ["path", "prompt"],
+        "run_test":        ["code"],
+        "patch_file":      ["path", "instruction"],
+        "update_document": ["section", "content"],
+    }
+    fields = required.get(name, [])
+    missing = [f for f in fields if not args.get(f)]
+    if missing:
+        return (
+            f"❌ {name} called with missing/empty required field(s): "
+            f"{', '.join(missing)}. "
+            f"This is likely a generation error — retry with the intended values."
+        )
+    return None
+
 
 async def _build_context_messages(tool_name: str) -> list[dict]:
     """

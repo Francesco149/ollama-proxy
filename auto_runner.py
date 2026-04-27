@@ -1,19 +1,27 @@
 """
 auto_runner.py
 
-Agentic loop using the model's native tool-call protocol.
+Agentic loop using native tool-call protocol.
 
-Design:
-- Content tokens stream live to Open WebUI as they arrive
-- Tool calls accumulate via finish_reason="tool_calls", then execute
-- Results injected as role="tool" — the format the model was trained on
-- Shadow context (on_clean_turn) stores only clean prose + tool turns,
-  never any display markup — so the model never sees <details> in history
+Key design properties:
+  Working document: injected as the first system message each turn.
+    The model updates it via update_document — findings go there before
+    tool results are evicted from context.
 
-Display:
-- Params block yielded immediately when tool call is decided (before execution)
-- Result block yielded after execution with stripped single-line preview
-- Both are fully closed <details> blocks — no open HTML, no rendering glitches
+  Eviction: after each on_clean_turn callback, old turns are compressed.
+    role=tool results and command-output user turns become summary lines.
+    The model's prose is preserved. Budget is configurable.
+
+  Stuck detection: tracks consecutive identical tool calls and no-op turns.
+    Injects a single redirect nudge when stuck; avoids compounding by
+    limiting nudges to once per session of spinning.
+
+  Empty arg guard: validates tool args before execution. Returns a
+    structured error the model can self-correct from rather than executing
+    a no-op or crashing.
+
+  Context is never polluted with <details> markup — display blocks are
+  fire-and-forget yields to Open WebUI only.
 """
 
 import httpx
@@ -22,7 +30,7 @@ import logging
 import re
 from typing import Callable, Awaitable, AsyncGenerator
 
-from tool_manager import TOOLS
+from tool_manager import TOOLS, validate_tool_args
 
 log = logging.getLogger("auto-runner")
 
@@ -32,10 +40,9 @@ _RE_EXIT_CODE = re.compile(r'exit code: `(\d+)`')
 # ── display helpers ───────────────────────────────────────────────────────────
 
 def _strip_preview(text: str, max_len: int = 160) -> str:
-    """Single-line preview: strip markdown, collapse whitespace."""
     t = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    t = re.sub(r'`{2,}[^\n]*\n', '', t)          # opening fence lines
-    t = re.sub(r'`{2,}', '', t)                   # closing fences
+    t = re.sub(r'`{2,}[^\n]*\n', '', t)
+    t = re.sub(r'`{2,}', '', t)
     t = re.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', t)
     t = re.sub(r'`([^`]+)`', r'\1', t)
     t = re.sub(r'^[\-\*\+]\s+', '', t, flags=re.MULTILINE)
@@ -53,27 +60,26 @@ def _exit_code(result: str) -> int | None:
 
 
 def _details(summary: str, body: str) -> str:
-    """Fully closed collapsed block — double newline ensures block-level rendering."""
     return f"\n\n<details>\n<summary>{summary}</summary>\n\n{body}\n\n</details>\n"
 
 
 def _params_block(tool_name: str, args: dict) -> str:
-    """Yield immediately when the model decides to call a tool."""
-    icon = {"run_shell": "▶ $", "run_python": "▶ 🐍",
-            "spawn_agent": "🤖", "write_file": "📝"}.get(tool_name, "▶")
+    if tool_name == "update_document":
+        section = args.get("section", "")
+        content = args.get("content", "")[:120]
+        return _details(f"📋  [{section}]", f"**Section:** {section}\n\n{content}…")
 
     if tool_name == "run_shell":
         cmd = args.get("command", "")
-        summary = f"{icon}  {cmd[:80]}{'…' if len(cmd)>80 else ''}"
-        body = _fenced(cmd)
+        summary = f"▶  $ {cmd[:80]}{'…' if len(cmd)>80 else ''}"
+        return _details(summary, _fenced(cmd))
 
-    elif tool_name == "run_python":
+    if tool_name == "run_python":
         code = args.get("code", "")
         first = code.strip().split("\n")[0][:80]
-        summary = f"{icon}  {first}"
-        body = _fenced(code)
+        return _details(f"▶  🐍 {first}", _fenced(code))
 
-    elif tool_name == "spawn_agent":
+    if tool_name == "spawn_agent":
         prompt    = args.get("prompt", "")
         file_path = args.get("file_path")
         files     = args.get("files", [])
@@ -82,101 +88,81 @@ def _params_block(tool_name: str, args: dict) -> str:
         names     = ", ".join(f.split("/")[-1] for f in all_files[:3])
         if len(all_files) > 3:
             names += f" +{len(all_files)-3}"
-        summary = f"{icon}  {preview}" + (f"  —  {names}" if names else "")
-
+        summary = f"🤖  {preview}" + (f"  —  {names}" if names else "")
         parts = []
         if all_files:
             parts.append("**Files:**\n" + "\n".join(f"- `{f}`" for f in all_files))
         if args.get("context"):
             parts.append(f"**Context:** {args['context']}")
         parts.append(f"**Prompt:** {prompt}")
-        body = "\n\n".join(parts)
+        return _details(summary, "\n\n".join(parts))
 
-    elif tool_name == "write_file":
-        path   = args.get("path", "")
+    if tool_name == "write_file":
+        path = args.get("path", "")
         prompt = args.get("prompt", "")
-        summary = f"{icon}  {path}"
-        body = f"**Path:** `{path}`\n\n**Prompt:** {prompt}"
+        return _details(f"📝  {path}", f"**Path:** `{path}`\n\n**Prompt:** {prompt}")
 
-    elif tool_name == "run_test":
+    if tool_name == "run_test":
         hyp  = args.get("hypothesis", "")
         code = args.get("code", "")
         first = code.strip().split("\n")[0][:80]
         summary = f"🧪  {hyp[:80]}" if hyp else f"🧪  {first}"
-        body_parts = []
+        parts = []
         if hyp:
-            body_parts.append(f"**Hypothesis:** {hyp}")
-        body_parts.append(f"**Code:**\n\n{_fenced(code)}")
-        body = "\n\n".join(body_parts)
+            parts.append(f"**Hypothesis:** {hyp}")
+        parts.append(f"**Code:**\n\n{_fenced(code)}")
+        return _details(summary, "\n\n".join(parts))
 
-    elif tool_name == "patch_file":
+    if tool_name == "patch_file":
         path        = args.get("path", "")
         instruction = args.get("instruction", "")
-        summary = f"🩹  {path.split('/')[-1]}"
-        body = f"**Path:** `{path}`\n\n**Instruction:** {instruction}"
+        return _details(f"🩹  {path.split('/')[-1]}", f"**Path:** `{path}`\n\n**Instruction:** {instruction}")
 
-    else:
-        summary = f"▶  {tool_name}"
-        body = _fenced(json.dumps(args, indent=2))
-
-    return _details(summary, body)
+    return _details(f"▶  {tool_name}", _fenced(json.dumps(args, indent=2)))
 
 
 def _result_block(tool_name: str, args: dict, result: str) -> str:
-    """Yield after execution with result preview as summary."""
-    icon = {"run_shell": "✓ $" if (_exit_code(result) or 0) == 0 else "✗ $",
-            "run_python": "✓ 🐍" if (_exit_code(result) or 0) == 0 else "✗ 🐍",
-            "spawn_agent": "🤖", "write_file": "📝"}.get(tool_name, "✓")
+    if tool_name == "update_document":
+        return _details(f"📋  {_strip_preview(result)}", result)
 
     preview = _strip_preview(result)
 
     if tool_name == "run_shell":
         cmd = args.get("command", "")
+        code_val = _exit_code(result)
+        status = "✓" if code_val == 0 else (f"✗ exit {code_val}" if code_val is not None else "✗")
         body = f"**Command:**\n\n{_fenced(cmd)}\n\n**Output:**\n\n{_fenced(result)}"
+        return _details(f"{status}  {preview}", body)
 
-    elif tool_name == "run_python":
+    if tool_name == "run_python":
         code = args.get("code", "")
+        code_val = _exit_code(result)
+        status = "✓" if code_val == 0 else (f"✗ exit {code_val}" if code_val is not None else "✗")
         body = f"**Code:**\n\n{_fenced(code)}\n\n**Output:**\n\n{_fenced(result)}"
+        return _details(f"{status}  {preview}", body)
 
-    elif tool_name == "spawn_agent":
-        # Result is already markdown from the sub-agent — no extra fencing
-        body = result
+    if tool_name == "spawn_agent":
+        return _details(f"🤖  {preview}", result)
 
-    elif tool_name == "write_file":
+    if tool_name == "write_file":
         path = args.get("path", "")
         lines_m = re.search(r'\((\d+) lines\)', result)
         n_lines = int(lines_m.group(1)) if lines_m else 0
         preview_m = re.search(r'```\n(.*?)```', result, re.DOTALL)
         file_preview = preview_m.group(1) if preview_m else ""
-        preview = f"📝 {path} — {n_lines} lines"
         body = f"**Path:** `{path}`\n\n**Preview:**\n\n{_fenced(file_preview)}" if file_preview else result
+        return _details(f"📝  {path.split('/')[-1]} — {n_lines} lines", body)
 
-    elif tool_name == "run_test":
-        preview = _strip_preview(result)
+    if tool_name == "run_test":
         code_val = _exit_code(result)
         icon = "✓ 🧪" if code_val == 0 else "✗ 🧪"
-        summary = f"{icon}  {preview}"
-        return _details(summary, result)
+        return _details(f"{icon}  {preview}", result)
 
-    elif tool_name == "patch_file":
-        if result.startswith("Patch applied"):
-            summary = f"🩹  ✓  {args.get('path','').split('/')[-1]}"
-        else:
-            summary = f"🩹  ✗  {args.get('path','').split('/')[-1]}"
-        return _details(summary, result)
+    if tool_name == "patch_file":
+        icon = "🩹  ✓" if result.startswith("Patch applied") else "🩹  ✗"
+        return _details(f"{icon}  {args.get('path','').split('/')[-1]}", result)
 
-    else:
-        body = _fenced(result)
-
-    # For shell/python prepend the exit-code icon to the preview
-    if tool_name in ("run_shell", "run_python"):
-        code_val = _exit_code(result)
-        status = "✓" if code_val == 0 else (f"✗ exit {code_val}" if code_val is not None else "✗")
-        summary = f"{status}  {preview}"
-    else:
-        summary = f"{icon}  {preview}"
-
-    return _details(summary, body)
+    return _details(f"✓  {preview}", _fenced(result))
 
 
 def _make_chunk(model: str, content: str, done: bool = False) -> str:
@@ -187,6 +173,53 @@ def _make_chunk(model: str, content: str, done: bool = False) -> str:
     }) + "\n"
 
 
+# ── stuck detection ───────────────────────────────────────────────────────────
+
+_STUCK_NUDGE = (
+    "You appear to be repeating the same action or producing empty responses. "
+    "Stop and take stock: call update_document to record what you know so far "
+    "(Findings, current Plan state, any Open Questions), then reconsider the "
+    "approach from first principles. If you're unsure what to do next, say so "
+    "clearly rather than retrying the same tool call."
+)
+
+
+class StuckDetector:
+    def __init__(self, repeat_threshold: int = 2, empty_threshold: int = 2):
+        self.repeat_threshold = repeat_threshold
+        self.empty_threshold  = empty_threshold
+        self._last_call: str | None = None
+        self._repeat_count   = 0
+        self._empty_count    = 0
+        self._nudge_sent     = False
+
+    def record_tool_call(self, name: str, args: dict) -> bool:
+        """Return True if this looks like a stuck repeat."""
+        key = f"{name}:{json.dumps(args, sort_keys=True)}"
+        if key == self._last_call:
+            self._repeat_count += 1
+        else:
+            self._repeat_count = 0
+            self._last_call = key
+        return self._repeat_count >= self.repeat_threshold
+
+    def record_empty_turn(self) -> bool:
+        """Return True if we've had too many empty/no-tool turns."""
+        self._empty_count += 1
+        return self._empty_count >= self.empty_threshold
+
+    def reset_empty(self) -> None:
+        self._empty_count = 0
+
+    def should_nudge(self) -> bool:
+        return not self._nudge_sent
+
+    def mark_nudged(self) -> None:
+        self._nudge_sent = True
+        self._repeat_count = 0
+        self._empty_count  = 0
+
+
 # ── streaming ─────────────────────────────────────────────────────────────────
 
 async def _stream_one_turn(
@@ -195,15 +228,13 @@ async def _stream_one_turn(
     model_name: str,
 ) -> AsyncGenerator[tuple, None]:
     """
-    Stream one LLM turn.
-
-    Yields:
+    Stream one LLM turn. Yields:
       ("text",  chunk_str, content)      — forward content token
-      ("tool",  chunk_str, tool_calls)   — model decided to call tools
-      ("done",  "",        full_content) — clean finish, no tool call
+      ("tool",  "",        tool_calls)   — model called tools
+      ("done",  "",        full_content) — clean finish
     """
     full_content = ""
-    tool_calls_buf: dict[int, dict] = {}   # index → {name, args_str, id}
+    tool_calls_buf: dict[int, dict] = {}
 
     async with httpx.AsyncClient(timeout=300) as client:
         async with client.stream(
@@ -216,12 +247,11 @@ async def _stream_one_turn(
                 if raw == "[DONE]":
                     break
                 try:
-                    chunk = json.loads(raw)
+                    chunk  = json.loads(raw)
                     choice = chunk["choices"][0]
                     delta  = choice["delta"]
                     finish = choice.get("finish_reason")
 
-                    # ── tool call accumulation ────────────────────────────────
                     if delta.get("tool_calls"):
                         for tc in delta["tool_calls"]:
                             idx = tc.get("index", 0)
@@ -251,7 +281,6 @@ async def _stream_one_turn(
                         yield "tool", "", tool_calls
                         return
 
-                    # ── content token ─────────────────────────────────────────
                     content = delta.get("content", "")
                     if content:
                         full_content += content
@@ -276,23 +305,34 @@ async def run_agentic_chat(
     max_iterations: int = 10,
     max_consecutive_failures: int = 3,
     on_clean_turn: Callable[[str, list | None], None] | None = None,
+    working_doc_system_msg: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     """
-    Agentic loop using native tool-call protocol.
+    Agentic loop with working document, stuck detection, and arg validation.
 
-    on_clean_turn(assistant_content, tool_results_or_None):
-      assistant_content: prose the model generated this turn
-      tool_results_or_None: list of {"tool_call_id", "name", "result"} or None
+    working_doc_system_msg: if provided, prepended to messages each iteration
+      so the model always sees the current document state.
+
+    on_clean_turn(assistant_content, tool_results_or_None): called after each
+      complete iteration for shadow context persistence and eviction.
     """
     messages = list(openai_body["messages"])
     consecutive_failures = 0
+    stuck = StuckDetector()
 
     for iteration in range(max_iterations):
         log.info(f"iteration {iteration}, messages={len(messages)}")
 
+        # Inject current working document as first system message
+        iter_messages = messages
+        if working_doc_system_msg:
+            # Replace or prepend the working doc system message
+            non_doc = [m for m in messages if not m.get("_working_doc")]
+            iter_messages = [working_doc_system_msg] + non_doc
+
         body = {
             **openai_body,
-            "messages": messages,
+            "messages": iter_messages,
             "stream": True,
             "tools": TOOLS,
             "tool_choice": "auto",
@@ -305,47 +345,86 @@ async def run_agentic_chat(
             if kind == "text":
                 prose += payload
                 yield chunk_str
-
             elif kind == "tool":
                 tool_calls = payload
                 break
-
             elif kind == "done":
                 prose = payload
                 break
 
         # ── clean finish ──────────────────────────────────────────────────────
         if tool_calls is None:
+            if len(prose.strip()) < 50:
+                # Suspiciously empty response
+                if stuck.record_empty_turn() and stuck.should_nudge():
+                    log.warning(f"iteration {iteration}: empty turn, injecting nudge")
+                    stuck.mark_nudged()
+                    nudge_msg = {"role": "user", "content": _STUCK_NUDGE}
+                    messages.append({"role": "assistant", "content": prose})
+                    messages.append(nudge_msg)
+                    continue
             log.info(f"iteration {iteration}: clean finish")
             if on_clean_turn:
                 on_clean_turn(prose, None)
             yield _make_chunk(model_name, "", done=True)
             return
 
+        stuck.reset_empty()
+
         # ── execute tool calls ────────────────────────────────────────────────
         tool_results = []
         had_failure  = False
+        is_update_doc = False
 
         for tc in tool_calls:
-            name = tc["name"]
-            args = tc["args"]
+            name    = tc["name"]
+            args    = tc["args"]
             call_id = tc["id"]
 
-            log.info(f"iteration {iteration}: tool={name} args_keys={list(args)}")
+            # update_document is handled inline — no execute_tool_fn needed
+            if name == "update_document":
+                is_update_doc = True
+                yield _make_chunk(model_name, _params_block(name, args))
+                result = await execute_tool_fn(name, args)  # calls _execute_update_document
+                yield _make_chunk(model_name, _result_block(name, args, result))
+                tool_results.append({"tool_call_id": call_id, "name": name, "result": result})
+                continue
+
+            # Validate args before executing anything
+            err = validate_tool_args(name, args)
+            if err:
+                log.warning(f"iteration {iteration}: {name} bad args: {err}")
+                yield _make_chunk(model_name, f"\n{err}\n")
+                tool_results.append({"tool_call_id": call_id, "name": name, "result": err})
+                had_failure = True
+                continue
+
+            # Stuck detection
+            if stuck.record_tool_call(name, args) and stuck.should_nudge():
+                log.warning(f"iteration {iteration}: stuck on {name}, injecting nudge")
+                stuck.mark_nudged()
+                yield _make_chunk(model_name, f"\n\n⚠️ {_STUCK_NUDGE}\n\n")
+                tool_results.append({
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "result": f"[Stuck detected — {_STUCK_NUDGE}]",
+                })
+                continue
+
+            log.info(f"iteration {iteration}: {name} args_keys={list(args)}")
 
             # Params block — yield immediately before execution
             yield _make_chunk(model_name, _params_block(name, args))
 
             result = await execute_tool_fn(name, args)
 
-            # Track failures for shell/python only
+            # Track failures for shell/python
             if name in ("run_shell", "run_python"):
                 code = _exit_code(result)
                 if (code or 0) != 0:
                     had_failure = True
                     log.warning(f"non-zero exit for {name}")
 
-            # Result block
             yield _make_chunk(model_name, _result_block(name, args, result))
 
             tool_results.append({
@@ -371,7 +450,6 @@ async def run_agentic_chat(
             on_clean_turn(prose, tool_results)
 
         # ── inject into message history ───────────────────────────────────────
-        # Assistant turn: prose + tool_calls array (OpenAI multi-turn format)
         messages.append({
             "role": "assistant",
             "content": prose,
@@ -382,14 +460,16 @@ async def run_agentic_chat(
                     "function": {
                         "name": tr["name"],
                         "arguments": json.dumps(
-                            next(tc["args"] for tc in tool_calls if tc["id"] == tr["tool_call_id"])
+                            next(
+                                (tc["args"] for tc in tool_calls if tc["id"] == tr["tool_call_id"]),
+                                {},
+                            )
                         ),
                     },
                 }
                 for tr in tool_results
             ],
         })
-        # One role=tool message per result
         for tr in tool_results:
             messages.append({
                 "role": "tool",
@@ -397,6 +477,6 @@ async def run_agentic_chat(
                 "content": tr["result"],
             })
 
-        log.info(f"iteration {iteration}: {len(tool_results)} tool result(s) injected, looping")
+        log.info(f"iteration {iteration}: {len(tool_results)} tool result(s), looping")
 
     yield _make_chunk(model_name, "", done=True)

@@ -43,3 +43,12 @@ run_test    = "none"
 
 # Max conversation turns to include in "full" mode (most recent N)
 max_messages = 20
+
+[context]
+# Eviction keeps the last N assistant+tool iteration pairs verbatim.
+# Older turns have their role=tool content replaced with summary lines.
+eviction_keep_turns = 8
+
+# Estimated token budget for the message history (excl. system messages).
+# A second eviction pass runs if the first doesn't bring it under budget.
+token_budget = 12000
