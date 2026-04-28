@@ -200,22 +200,25 @@ class StuckDetector:
         self.repeat_threshold = repeat_threshold
         self.empty_threshold  = empty_threshold
         if state:
-            self._last_call    = state.get("last_call")
-            self._repeat_count = state.get("repeat_count", 0)
-            self._empty_count  = state.get("empty_count", 0)
-            self._nudge_sent   = state.get("nudge_sent", False)
+            self._last_call        = state.get("last_call")
+            self._repeat_count     = state.get("repeat_count", 0)
+            self._empty_count      = state.get("empty_count", 0)
+            self._nudge_sent       = state.get("nudge_sent", False)
+            self._suppressed_tools = set(state.get("suppressed_tools", []))
         else:
             self._last_call: str | None = None
             self._repeat_count   = 0
             self._empty_count    = 0
             self._nudge_sent     = False
+            self._suppressed_tools: set[str] = set()
 
     def to_dict(self) -> dict:
         return {
-            "last_call":    self._last_call,
-            "repeat_count": self._repeat_count,
-            "empty_count":  self._empty_count,
-            "nudge_sent":   self._nudge_sent,
+            "last_call":        self._last_call,
+            "repeat_count":     self._repeat_count,
+            "empty_count":      self._empty_count,
+            "nudge_sent":       self._nudge_sent,
+            "suppressed_tools": list(self._suppressed_tools),
         }
 
     def record_tool_call(self, name: str, args: dict) -> bool:
@@ -239,10 +242,19 @@ class StuckDetector:
     def should_nudge(self) -> bool:
         return not self._nudge_sent
 
-    def mark_nudged(self) -> None:
+    def mark_nudged(self, tool_name: str | None = None) -> None:
         self._nudge_sent = True
         self._repeat_count = 0
         self._empty_count  = 0
+        if tool_name:
+            self._suppressed_tools.add(tool_name)
+
+    def get_suppressed_tools(self) -> set[str]:
+        return set(self._suppressed_tools)
+
+    def clear_suppressed_tools(self) -> None:
+        self._suppressed_tools.clear()
+        self._nudge_sent = False  # allow another nudge after suppression resolves
 
 
 # ── streaming ─────────────────────────────────────────────────────────────────
@@ -333,6 +345,7 @@ async def run_agentic_chat(
     working_doc_system_msg: dict | None = None,
     stuck_state: dict | None = None,
     on_stuck_state: Callable[[dict], None] | None = None,
+    tool_suppression_enabled: bool = True,
 ) -> AsyncGenerator[str, None]:
     """
     Agentic loop with working document, stuck detection, and arg validation.
@@ -341,6 +354,9 @@ async def run_agentic_chat(
       Persisting across requests prevents the reset-each-turn bug.
     on_stuck_state: called after each iteration with the current stuck state
       dict so the caller can persist it.
+    tool_suppression_enabled: when True, tools that trigger stuck detection
+      are temporarily removed from the tool list for subsequent iterations.
+      Re-enabled once a different tool is called successfully.
     working_doc_system_msg: prepended to messages each iteration.
     on_clean_turn: called after each iteration for shadow context persistence.
     """
@@ -358,11 +374,17 @@ async def run_agentic_chat(
             non_doc = [m for m in messages if not m.get("_working_doc")]
             iter_messages = [working_doc_system_msg] + non_doc
 
+        # Filter out suppressed tools for this iteration
+        suppressed = stuck.get_suppressed_tools() if tool_suppression_enabled else set()
+        active_tools = [t for t in TOOLS if t["function"]["name"] not in suppressed]
+        if suppressed:
+            log.warning(f"iteration {iteration}: suppressing tools: {suppressed}")
+
         body = {
             **openai_body,
             "messages": iter_messages,
             "stream": True,
-            "tools": TOOLS,
+            "tools": active_tools,
             "tool_choice": "auto",
         }
 
@@ -418,10 +440,14 @@ async def run_agentic_chat(
             # An empty repeated call is just as stuck as a valid repeated one.
             if stuck.record_tool_call(name, args) and stuck.should_nudge():
                 log.warning(f"iteration {iteration}: stuck on {name}, injecting nudge")
-                stuck.mark_nudged()
+                if tool_suppression_enabled:
+                    stuck.mark_nudged(tool_name=name)
+                    log.warning(f"suppressing tool '{name}' for subsequent iterations")
+                else:
+                    stuck.mark_nudged()
                 nudge = f"[Stuck: {_STUCK_NUDGE}]"
                 yield _make_chunk(model_name, f"\n\n⚠️ {_STUCK_NUDGE}\n\n")
-                tool_results.append({"tool_call_id": call_id, "name": name, "result": nudge})
+                tool_results.append({"tool_call_id": call_id, "name": name, "result": nudge, "arguments": json.dumps(args)})
                 continue
 
             # ── 2. arg validation ────────────────────────────────────────────
@@ -429,7 +455,8 @@ async def run_agentic_chat(
             if err:
                 log.warning(f"iteration {iteration}: {name} bad args: {err}")
                 yield _make_chunk(model_name, f"\n{err}\n")
-                tool_results.append({"tool_call_id": call_id, "name": name, "result": err})
+                tool_results.append({"tool_call_id": call_id, "name": name, "result": err,
+                                      "arguments": json.dumps(args)})
                 had_failure = True
                 continue
 
@@ -439,7 +466,7 @@ async def run_agentic_chat(
                 yield _make_chunk(model_name, _params_block(name, args))
                 result = await execute_tool_fn(name, args)
                 yield _make_chunk(model_name, _result_block(name, args, result))
-                tool_results.append({"tool_call_id": call_id, "name": name, "result": result})
+                tool_results.append({"tool_call_id": call_id, "name": name, "result": result, "arguments": json.dumps(args)})
                 continue
 
             # ── 4. all other tools ───────────────────────────────────────────
@@ -457,10 +484,17 @@ async def run_agentic_chat(
 
             yield _make_chunk(model_name, _result_block(name, args, result))
 
+            # Successful call — if this tool was suppressed before, clear all suppression
+            # (the model has moved on, so the stuck state is resolved)
+            if tool_suppression_enabled and name in stuck.get_suppressed_tools():
+                log.info(f"iteration {iteration}: {name} succeeded after suppression — clearing")
+                stuck.clear_suppressed_tools()
+
             tool_results.append({
                 "tool_call_id": call_id,
-                "name": name,
-                "result": result,
+                "name":         name,
+                "result":       result,
+                "arguments":    json.dumps(args),
             })
 
         consecutive_failures = (consecutive_failures + 1) if had_failure else 0
@@ -490,13 +524,8 @@ async def run_agentic_chat(
                     "id": tr["tool_call_id"],
                     "type": "function",
                     "function": {
-                        "name": tr["name"],
-                        "arguments": json.dumps(
-                            next(
-                                (tc["args"] for tc in tool_calls if tc["id"] == tr["tool_call_id"]),
-                                {},
-                            )
-                        ),
+                        "name":      tr["name"],
+                        "arguments": tr.get("arguments", "{}"),
                     },
                 }
                 for tr in tool_results

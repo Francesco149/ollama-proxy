@@ -47,6 +47,9 @@ ctx_cfg = config.get("context", {})
 EVICTION_KEEP_TURNS = ctx_cfg.get("eviction_keep_turns", 8)
 EVICTION_TOKEN_BUDGET = ctx_cfg.get("token_budget", 12000)
 
+autorun_cfg = config.get("autorun", {})
+TOOL_SUPPRESSION_ENABLED = autorun_cfg.get("tool_suppression", True)
+
 REAL_MODEL = None
 
 # ── app + singletons ──────────────────────────────────────────────────────────
@@ -266,7 +269,12 @@ async def chat(request: Request):
                     {
                         "id": tr["tool_call_id"],
                         "type": "function",
-                        "function": {"name": tr["name"], "arguments": "{}"},
+                        "function": {
+                            "name": tr["name"],
+                            # Store actual arguments — "{}" here would teach the model
+                            # that empty args are valid, corrupting future generations.
+                            "arguments": tr.get("arguments", "{}"),
+                        },
                     }
                     for tr in tool_results
                 ]
@@ -313,6 +321,7 @@ async def chat(request: Request):
                 working_doc_system_msg=working_doc_msg,
                 stuck_state=stuck_state,
                 on_stuck_state=on_stuck_state,
+                tool_suppression_enabled=TOOL_SUPPRESSION_ENABLED,
             ),
             media_type="application/x-ndjson",
         )
