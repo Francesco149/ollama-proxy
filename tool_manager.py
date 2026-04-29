@@ -200,6 +200,60 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_code",
+            "description": (
+                "Search for a symbol, pattern, or string across the codebase using git grep. "
+                "Use this instead of spawn_agent when you want to find where something is defined "
+                "or used. Returns matching lines with file paths and line numbers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "The string or regex pattern to search for.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional subdirectory or glob to restrict search (e.g. 'modules/' or '*.py').",
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "Whether the search is case-sensitive (default: true).",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read the contents of a file. For large files, only the first N characters "
+                "are returned with a warning — use search_code or spawn_agent to inspect "
+                "specific parts instead of reading huge files in full."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to read.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Max characters to return (default: 4000). Increase only if you need more context.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_test",
             "description": (
                 "Write a Python test script to /tmp, execute it, and return the output. "
@@ -347,6 +401,12 @@ async def execute_tool(name: str, args: dict) -> str:
     if name == "git_commit":
         return await _execute_git_commit(args)
 
+    if name == "search_code":
+        return await _execute_search_code(args)
+
+    if name == "read_file":
+        return await _execute_read_file(args)
+
     return f"Unknown tool: {name}"
 
 
@@ -475,6 +535,8 @@ def validate_tool_args(name: str, args: dict) -> str | None:
         "patch_file":      ["path", "instruction"],
         "update_document": ["section", "content"],
         "git_commit":      ["message"],
+        "search_code":     ["pattern"],
+        "read_file":       ["path"],
     }
     fields = required.get(name, [])
     missing = [f for f in fields if not args.get(f)]
@@ -997,6 +1059,50 @@ async def _handle_py(messages: list) -> str:
 
 async def _handle_diff(_messages: list) -> str:
     return await execute_tool("run_shell", {"command": "git diff HEAD~1 HEAD"})
+
+
+async def _execute_search_code(args: dict) -> str:
+    """git grep wrapper — fast symbol search across the codebase."""
+    pattern  = args.get("pattern", "")
+    path     = args.get("path", "")
+    case_ok  = args.get("case_sensitive", True)
+    if not SHELL_SERVER_URL:
+        return "❌ search_code: shell server not registered"
+    flag = "" if case_ok else "-i "
+    path_arg = f"-- {path!r}" if path else ""
+    cmd = f"git grep -n {flag}{__import__('shlex').quote(pattern)} {path_arg}".strip()
+    log.info(f"search_code: {cmd!r}")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{SHELL_SERVER_URL}/exec", json={"command": cmd})
+            r = resp.json()
+        stdout = r.get("stdout", "")
+        code   = r.get("exit_code", 0)
+        if code == 1 and not stdout:
+            return f"No matches for {pattern!r}{' in ' + path if path else ''}."
+        return stdout or r.get("stderr", "no output")
+    except Exception as e:
+        return f"❌ search_code: {e}"
+
+
+READ_FILE_MAX_CHARS = 4000
+
+async def _execute_read_file(args: dict) -> str:
+    """Read a file, truncating large files with a warning."""
+    path      = args.get("path", "")
+    max_chars = int(args.get("max_chars", READ_FILE_MAX_CHARS))
+    if not SHELL_SERVER_URL:
+        return "❌ read_file: shell server not registered"
+    content, err = await _read_file_via_shell(path)
+    if err:
+        return err
+    if len(content) > max_chars:
+        warning = (
+            f"[File truncated: {path} is {len(content)} chars, showing first {max_chars}. "
+            "Use search_code to find specific symbols or spawn_agent to analyse a section.]"
+        )
+        return warning + "\n\n" + content[:max_chars]
+    return content
 
 
 async def _get_model_name() -> str:

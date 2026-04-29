@@ -104,14 +104,16 @@ def evict_old_turns(
     system_msgs = [m for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
 
-    if _estimate_tokens(rest) <= token_budget and len(rest) <= keep_turns * 2:
-        return messages
-
-    # Find the keep boundary — last keep_turns assistant messages
+    # Count assistant turns as the reliable eviction signal.
+    # Token estimate is a rough budget check only.
     assistant_indices = [i for i, m in enumerate(rest) if m.get("role") == "assistant"]
-    if len(assistant_indices) <= keep_turns:
-        return messages  # not enough history to evict anything
+    enough_history = len(assistant_indices) > keep_turns
+    over_budget = _estimate_tokens(rest) > token_budget
+    if not enough_history and not over_budget:
+        return messages  # nothing to evict yet
 
+    if len(assistant_indices) <= keep_turns:
+        return messages  # guard — shouldn't be reached but keep for safety
     evict_before = assistant_indices[-keep_turns]
 
     evicted = []

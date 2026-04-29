@@ -1,4 +1,4 @@
-> **Disclaimer:** This README was written with AI assistance. This is a personal, ad-hoc project built for my own use — expect rough edges and fast-moving changes.
+> **Disclaimer:** This entire project was built with AI assistance (primarily using itself, once it was functional enough). It is a personal, ad-hoc tool for my own use — expect rough edges and fast-moving changes. Not intended for production use.
 
 # ollama-proxy
 
@@ -13,6 +13,7 @@ The proxy intercepts chat requests, detects when the model wants to use tools (v
 ## What it does
 
 - **Native tool-call protocol** — uses the model's own function-calling format, not XML hacks
+- **Tested with** `gemma-4-26B-A4B-APEX-I-Mini.gguf` (Gemma 4 27B A4B APEX Mini quant) — runs at 90–100 tokens/s on an AMD RX 7800 XT 16GB
 - **Agentic loop** — automatically chains tool calls up to a configurable iteration limit
 - **Working Document** — a persistent structured document (Project / Task / Findings / Plan / Decisions) injected into every turn so the model maintains context across a long session
 - **Context eviction** — old tool results are compressed out of the shadow context; findings go into the Working Document first so nothing is lost

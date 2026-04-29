@@ -122,56 +122,73 @@ def _params_block(tool_name: str, args: dict) -> str:
         msg = args.get("message", "")
         return _details(f"📦  git commit: {msg}", f"**Message:** {msg}")
 
+    if tool_name == "search_code":
+        n = len([l for l in result.strip().split("\n") if l])
+        label = "search: " + str(n) + (" matches" if n != 1 else " match")
+        return _details(label, _fenced(result))
+
+    if tool_name == "read_file":
+        truncated = "[truncated] " if result.startswith("[File truncated") else ""
+        return _details("read_file: " + truncated + _strip_preview(result), _fenced(result))
+        return _details(f"📄  {path.split('/')[-1]}", f"**Path:** `{path}`")
+
     return _details(f"▶  {tool_name}", _fenced(json.dumps(args, indent=2)))
 
 
 def _result_block(tool_name: str, args: dict, result: str) -> str:
-    if tool_name == "update_document":
-        return _details(f"📋  {_strip_preview(result)}", result)
-
     preview = _strip_preview(result)
+
+    if tool_name == "update_document":
+        return _details("[doc] " + preview, result)
 
     if tool_name == "run_shell":
         cmd = args.get("command", "")
         code_val = _exit_code(result)
-        status = "✓" if code_val == 0 else (f"✗ exit {code_val}" if code_val is not None else "✗")
-        body = f"**Command:**\n\n{_fenced(cmd)}\n\n**Output:**\n\n{_fenced(result)}"
-        return _details(f"{status}  {preview}", body)
+        status = "ok" if code_val == 0 else ("exit " + str(code_val) if code_val is not None else "err")
+        body = "**Command:**\n\n" + _fenced(cmd) + "\n\n**Output:**\n\n" + _fenced(result)
+        return _details(status + "  $ " + preview, body)
 
     if tool_name == "run_python":
         code = args.get("code", "")
         code_val = _exit_code(result)
-        status = "✓" if code_val == 0 else (f"✗ exit {code_val}" if code_val is not None else "✗")
-        body = f"**Code:**\n\n{_fenced(code)}\n\n**Output:**\n\n{_fenced(result)}"
-        return _details(f"{status}  {preview}", body)
+        status = "ok" if code_val == 0 else ("exit " + str(code_val) if code_val is not None else "err")
+        body = "**Code:**\n\n" + _fenced(code) + "\n\n**Output:**\n\n" + _fenced(result)
+        return _details(status + "  py  " + preview, body)
 
     if tool_name == "spawn_agent":
-        return _details(f"🤖  {preview}", result)
+        return _details("agent: " + preview, result)
 
     if tool_name == "write_file":
         path = args.get("path", "")
-        lines_m = re.search(r'\((\d+) lines\)', result)
+        lines_m = re.search(r"\((\d+) lines\)", result)
         n_lines = int(lines_m.group(1)) if lines_m else 0
-        preview_m = re.search(r'```\n(.*?)```', result, re.DOTALL)
+        preview_m = re.search(r"```\n(.*?)```", result, re.DOTALL)
         file_preview = preview_m.group(1) if preview_m else ""
-        body = f"**Path:** `{path}`\n\n**Preview:**\n\n{_fenced(file_preview)}" if file_preview else result
-        return _details(f"📝  {path.split('/')[-1]} — {n_lines} lines", body)
+        body = "**Path:** `" + path + "`\n\n**Preview:**\n\n" + _fenced(file_preview) if file_preview else result
+        return _details("write: " + path.split("/")[-1] + " (" + str(n_lines) + " lines)", body)
 
     if tool_name == "run_test":
         code_val = _exit_code(result)
-        icon = "✓ 🧪" if code_val == 0 else "✗ 🧪"
-        return _details(f"{icon}  {preview}", result)
+        status = "pass" if code_val == 0 else "fail"
+        return _details("test: " + status + "  " + preview, result)
 
     if tool_name == "patch_file":
-        icon = "🩹  ✓" if result.startswith("Patch applied") else "🩹  ✗"
-        return _details(f"{icon}  {args.get('path','').split('/')[-1]}", result)
+        ok = result.startswith("Patch applied")
+        return _details(("patch ok: " if ok else "patch fail: ") + args.get("path", "").split("/")[-1], result)
 
     if tool_name == "git_commit":
-        icon = "✓ 📦" if result.startswith("✓") else "✗ 📦"
-        return _details(f"{icon}  {_strip_preview(result)}", result)
+        ok = result.startswith(chr(10038) + " Committed") or result.startswith("ok") or "Committed" in result
+        return _details(("commit ok: " if ok else "commit fail: ") + preview, result)
 
-    return _details(f"✓  {preview}", _fenced(result))
+    if tool_name == "search_code":
+        n = len([l for l in result.strip().split("\n") if l.strip()])
+        return _details("search: " + str(n) + (" matches" if n != 1 else " match") + "  " + preview, _fenced(result))
 
+    if tool_name == "read_file":
+        truncated = "[truncated] " if result.startswith("[File truncated") else ""
+        return _details("read: " + truncated + preview, _fenced(result))
+
+    return _details("ok  " + preview, _fenced(result))
 
 def _make_chunk(model: str, content: str, done: bool = False) -> str:
     return json.dumps({
@@ -354,6 +371,7 @@ async def run_agentic_chat(
     stuck_state: dict | None = None,
     on_stuck_state: Callable[[dict], None] | None = None,
     tool_suppression_enabled: bool = True,
+    working_doc_reminder_interval: int = 4,
 ) -> AsyncGenerator[str, None]:
     """
     Agentic loop with working document, stuck detection, and arg validation.
@@ -547,5 +565,16 @@ async def run_agentic_chat(
             })
 
         log.info(f"iteration {iteration}: {len(tool_results)} tool result(s), looping")
+
+        # Inject a Working Document reminder every (keep_turns // 2) iterations
+        # so the model doesn't drift without updating findings/plan.
+        if working_doc_reminder_interval and iteration > 0 and                 iteration % working_doc_reminder_interval == 0:
+            reminder = (
+                "**Reminder:** Before continuing, call `update_document` to record "
+                "any new Findings and mark completed steps in Plan. "
+                "Tool results that haven't been captured there will be evicted soon."
+            )
+            messages.append({"role": "user", "content": reminder})
+            log.info(f"iteration {iteration}: injected working-doc reminder")
 
     yield _make_chunk(model_name, "", done=True)

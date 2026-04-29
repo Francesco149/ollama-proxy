@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# sandbox — run the ollama-proxy shell-server inside a Docker container
-# mounted on the current project directory.
+# sandbox — run the ollama-proxy shell-server inside a Docker container.
 #
 # Usage:
 #   sandbox                   # start (blocking, Ctrl-C to stop)
-#   sandbox build             # rebuild the Docker image
+#   sandbox build             # force rebuild the Docker image
 #   sandbox stop              # stop a running sandbox container
 #
 # Environment variables:
@@ -20,11 +19,30 @@ SHELL_PORT="${SHELL_PORT:-8000}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(pwd)"
+DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
+STAMP_FILE="${SCRIPT_DIR}/.sandbox_build_stamp"
 
 build() {
     echo "[sandbox] Building image ${IMAGE}..."
     docker build -t "${IMAGE}" "${SCRIPT_DIR}"
+    # Record checksum of Dockerfile so we can detect changes
+    sha256sum "${DOCKERFILE}" > "${STAMP_FILE}"
     echo "[sandbox] Build complete."
+}
+
+needs_rebuild() {
+    # Rebuild if image doesn't exist or Dockerfile has changed since last build
+    if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ ! -f "${STAMP_FILE}" ]; then
+        return 0
+    fi
+    if ! sha256sum --check --status "${STAMP_FILE}" 2>/dev/null; then
+        echo "[sandbox] Dockerfile changed — rebuilding..."
+        return 0
+    fi
+    return 1
 }
 
 stop_existing() {
@@ -36,39 +54,37 @@ stop_existing() {
 
 start() {
     stop_existing
-
-    if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-        build
-    fi
+    needs_rebuild && build
 
     echo "[sandbox] Starting sandbox"
     echo "  Project : ${PROJECT_DIR}"
     echo "  Proxy   : ${PROXY_URL}"
     echo "  Port    : ${SHELL_PORT}"
 
-    # Mount SCRIPT_DIR read-only when it differs from PROJECT_DIR so
-    # shell_server.py is always reachable at its real path.
+    # Mount SCRIPT_DIR read-only when it differs from PROJECT_DIR
     EXTRA_MOUNT=""
     if [ "${SCRIPT_DIR}" != "${PROJECT_DIR}" ]; then
         EXTRA_MOUNT="-v ${SCRIPT_DIR}:${SCRIPT_DIR}:ro"
     fi
 
-    # Git identity — mount host gitconfig and credentials read-only
-    # into /root and /home/ubuntu (covers both root and named-user cases).
+    # Git identity — mount into /home/ubuntu (matches the container user home
+    # that Docker creates for arbitrary UIDs via --user)
     GIT_MOUNTS=""
     [ -f "${HOME}/.gitconfig" ] && \
         GIT_MOUNTS="${GIT_MOUNTS} -v ${HOME}/.gitconfig:/home/ubuntu/.gitconfig:ro"
     [ -f "${HOME}/.git-credentials" ] && \
         GIT_MOUNTS="${GIT_MOUNTS} -v ${HOME}/.git-credentials:/home/ubuntu/.git-credentials:ro"
 
-    mkdir -p /tmp/scratch/
+    # /tmp/scratch — shared scratch dir for passing test files into the sandbox
+    mkdir -p /tmp/scratch
+
     docker run --rm \
         --name "${CONTAINER}" \
         --user "$(id -u):$(id -g)" \
         --add-host host.docker.internal:host-gateway \
         -e PROXY_URL="${PROXY_URL}" \
         -v "${PROJECT_DIR}:${PROJECT_DIR}" \
-        -v /tmp/scratch/:/tmp/scratch/ \
+        -v "/tmp/scratch:/tmp/scratch" \
         ${EXTRA_MOUNT} \
         ${GIT_MOUNTS} \
         -p "${SHELL_PORT}:8000" \
