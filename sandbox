@@ -5,14 +5,11 @@
 # Usage:
 #   sandbox                   # start (blocking, Ctrl-C to stop)
 #   sandbox build             # rebuild the Docker image
-#   sandbox stop              # stop any running sandbox container
+#   sandbox stop              # stop a running sandbox container
 #
-# The shell-server inside the container registers itself with the proxy
-# at PROXY_URL (default http://host.docker.internal:11434).
-# Set PROXY_URL in your environment to override.
-#
-# File permissions: container runs as the current host user so all writes
-# have the same UID/GID as you — no root-owned files in the project.
+# Environment variables:
+#   PROXY_URL    proxy to register with (default: http://host.docker.internal:11434)
+#   SHELL_PORT   host port to expose (default: 8000)
 
 set -euo pipefail
 
@@ -21,12 +18,7 @@ CONTAINER="ollama-proxy-sandbox-run"
 PROXY_URL="${PROXY_URL:-http://host.docker.internal:11434}"
 SHELL_PORT="${SHELL_PORT:-8000}"
 
-# Locate the ollama-proxy directory (where this script lives).
-# shell_server.py is always mounted from here, read-only, regardless of
-# which project directory is active — so sandbox works from any project.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# The project to mount is wherever the user ran sandbox from.
 PROJECT_DIR="$(pwd)"
 
 build() {
@@ -45,7 +37,6 @@ stop_existing() {
 start() {
     stop_existing
 
-    # Auto-build if image doesn't exist
     if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
         build
     fi
@@ -55,26 +46,30 @@ start() {
     echo "  Proxy   : ${PROXY_URL}"
     echo "  Port    : ${SHELL_PORT}"
 
-    # Mounts:
-    #   PROJECT_DIR — read-write, at real path so git/imports work
-    #   SCRIPT_DIR  — read-only, so shell_server.py is always reachable
-    #                 even when running from a different project dir
-    #
-    # Note: do NOT mount /opt/venv from the host — the venv is baked
-    # into the image. Mounting would shadow it with whatever (possibly
-    # empty) host path exists.
+    # Mount SCRIPT_DIR read-only when it differs from PROJECT_DIR so
+    # shell_server.py is always reachable at its real path.
     EXTRA_MOUNT=""
     if [ "${SCRIPT_DIR}" != "${PROJECT_DIR}" ]; then
         EXTRA_MOUNT="-v ${SCRIPT_DIR}:${SCRIPT_DIR}:ro"
     fi
+
+    # Git identity — mount host gitconfig and credentials read-only
+    # into /root and /home/ubuntu (covers both root and named-user cases).
+    GIT_MOUNTS=""
+    [ -f "${HOME}/.gitconfig" ] && \
+        GIT_MOUNTS="${GIT_MOUNTS} -v ${HOME}/.gitconfig:/root/.gitconfig:ro"
+    [ -f "${HOME}/.git-credentials" ] && \
+        GIT_MOUNTS="${GIT_MOUNTS} -v ${HOME}/.git-credentials:/root/.git-credentials:ro"
 
     docker run --rm \
         --name "${CONTAINER}" \
         --user "$(id -u):$(id -g)" \
         --add-host host.docker.internal:host-gateway \
         -e PROXY_URL="${PROXY_URL}" \
+        -e HOME="/root" \
         -v "${PROJECT_DIR}:${PROJECT_DIR}" \
         ${EXTRA_MOUNT} \
+        ${GIT_MOUNTS} \
         -p "${SHELL_PORT}:8000" \
         -w "${PROJECT_DIR}" \
         "${IMAGE}" \

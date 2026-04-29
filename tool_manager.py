@@ -292,6 +292,27 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_commit",
+            "description": (
+                "Stage all changes and create a git commit. "
+                "Write a concise commit message in a few words (e.g. 'add poll interval to task loop'). "
+                "Only call this when the user explicitly asks to commit, or has said to commit automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Short commit message, a few words, lowercase.",
+                    },
+                },
+                "required": ["message"],
+            },
+        },
+    },
 ]
 
 # ── tool execution ────────────────────────────────────────────────────────────
@@ -322,6 +343,9 @@ async def execute_tool(name: str, args: dict) -> str:
 
     if name == "patch_file":
         return await _execute_patch_file(args)
+
+    if name == "git_commit":
+        return await _execute_git_commit(args)
 
     return f"Unknown tool: {name}"
 
@@ -450,6 +474,7 @@ def validate_tool_args(name: str, args: dict) -> str | None:
         "run_test":        ["code"],
         "patch_file":      ["path", "instruction"],
         "update_document": ["section", "content"],
+        "git_commit":      ["message"],
     }
     fields = required.get(name, [])
     missing = [f for f in fields if not args.get(f)]
@@ -972,6 +997,59 @@ async def _handle_py(messages: list) -> str:
 
 async def _handle_diff(_messages: list) -> str:
     return await execute_tool("run_shell", {"command": "git diff HEAD~1 HEAD"})
+
+
+async def _get_model_name() -> str:
+    """Query llama.cpp /v1/models and return the first model id."""
+    if not _LLM_BASE:
+        return _LLM_MODEL or "unknown-model"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{_LLM_BASE}/v1/models")
+            data = resp.json()
+            models = data.get("data", [])
+            if models:
+                return models[0].get("id", _LLM_MODEL or "unknown-model")
+    except Exception as e:
+        log.warning(f"_get_model_name: {e}")
+    return _LLM_MODEL or "unknown-model"
+
+
+async def _execute_git_commit(args: dict) -> str:
+    """Stage all changes and commit with model name as co-signer."""
+    message = args.get("message", "").strip()
+    if not message:
+        return "❌ git_commit: message is required"
+    if not SHELL_SERVER_URL:
+        return "❌ git_commit: shell server not registered"
+
+    model_name = await _get_model_name()
+    # Sanitise model name for use in a git trailer
+    safe_model = re.sub(r"[^a-zA-Z0-9._/-]", "-", model_name)
+
+    commit_cmd = (
+        f'git add -A && git commit '
+        f'--message {__import__("shlex").quote(message)} '
+        f'--trailer "Co-authored-by: {safe_model} <{safe_model}@ollama-proxy>"'
+    )
+    log.info(f"git_commit: {message!r} co-signed by {safe_model}")
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{SHELL_SERVER_URL}/exec",
+                json={"command": commit_cmd},
+            )
+            r = resp.json()
+        stdout = r.get("stdout", "")
+        stderr = r.get("stderr", "")
+        code   = r.get("exit_code", -1)
+        if code == 0:
+            return f"✓ Committed: {message!r}\n\n{stdout}"
+        return f"❌ git commit failed (exit {code}):\n{stderr or stdout}"
+    except Exception as e:
+        log.error(f"git_commit error: {e}", exc_info=True)
+        return f"❌ git_commit: {e}"
 
 
 async def process_manual_command(messages: list) -> str | None:

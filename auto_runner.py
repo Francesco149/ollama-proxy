@@ -118,6 +118,10 @@ def _params_block(tool_name: str, args: dict) -> str:
         instruction = args.get("instruction", "")
         return _details(f"🩹  {path.split('/')[-1]}", f"**Path:** `{path}`\n\n**Instruction:** {instruction}")
 
+    if tool_name == "git_commit":
+        msg = args.get("message", "")
+        return _details(f"📦  git commit: {msg}", f"**Message:** {msg}")
+
     return _details(f"▶  {tool_name}", _fenced(json.dumps(args, indent=2)))
 
 
@@ -161,6 +165,10 @@ def _result_block(tool_name: str, args: dict, result: str) -> str:
     if tool_name == "patch_file":
         icon = "🩹  ✓" if result.startswith("Patch applied") else "🩹  ✗"
         return _details(f"{icon}  {args.get('path','').split('/')[-1]}", result)
+
+    if tool_name == "git_commit":
+        icon = "✓ 📦" if result.startswith("✓") else "✗ 📦"
+        return _details(f"{icon}  {_strip_preview(result)}", result)
 
     return _details(f"✓  {preview}", _fenced(result))
 
