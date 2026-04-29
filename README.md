@@ -1,4 +1,4 @@
-> **Disclaimer:** This entire project was built with AI assistance (primarily using itself, once it was functional enough). It is a personal, ad-hoc tool for my own use — expect rough edges and fast-moving changes. Not intended for production use.
+> **Disclaimer:** This entire project was built with AI assistance. It is a personal, ad-hoc tool for my own use — expect rough edges and fast-moving changes. Not intended for production use.
 
 # ollama-proxy
 
