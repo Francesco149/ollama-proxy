@@ -14,7 +14,7 @@ It also features a running document plus aggressive context eviction.
 
 This keeps the context small and maintains very quick response times from the LLM as it methodically gathers information and navigates the codebase.
 
-I currently use this with gemma4 26B a4b apex mini quant and it's a very responsive and viable local AI coding workflow which wrote most of this code and spec files.
+I currently use this with gemma4 26B a4b apex mini quant and it's a very responsive and viable local AI coding workflow.
 
 ## Quick Start
 
