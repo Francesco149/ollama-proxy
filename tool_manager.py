@@ -266,25 +266,25 @@ TOOLS = [
             "name": "patch_file",
             "description": (
                 "Apply a surgical edit to an existing file without loading it into context. "
-                "A sub-agent receives the file + instruction and produces a unified diff; "
-                "the proxy applies it with patch(1). Returns the resulting git diff on "
-                "success so you can verify the change. Retries once on apply failure. "
-                "Use instead of aider for targeted single-function edits."
+                "A sub-agent receives the full file + instruction and produces a "
+                "SEARCH/REPLACE block; the proxy applies it as a literal string replacement. "
+                "Returns a diff of the change on success. "
+                "Use for any targeted edit to an existing file — do NOT use write_file "
+                "to overwrite existing files, as it will silently drop all other functions."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to the file to patch.",
+                        "description": "Absolute path to the file to edit.",
                     },
                     "instruction": {
                         "type": "string",
                         "description": (
-                            "Precise edit instruction for the sub-agent. Include: "
-                            "exact function name, what currently happens, what should "
-                            "happen instead, any variable names or API calls involved. "
-                            "The more specific, the cleaner the diff."
+                            "Precise edit instruction. Include: exact function name, "
+                            "what currently happens, what should happen instead, "
+                            "any variable names, imports, or API calls involved."
                         ),
                     },
                 },
@@ -728,8 +728,16 @@ async def _execute_run_test(args: dict) -> str:
 
 async def _execute_patch_file(args: dict, _retry: bool = False) -> str:
     """
-    Sub-agent produces a unified diff for the given instruction;
-    shell_server applies it with patch(1). Retries once on failure.
+    Sub-agent produces a SEARCH/REPLACE block for the given instruction.
+    Applied as a literal string replacement — no diff format, no line-number
+    sensitivity. Retries once with explicit error feedback on failure.
+
+    Format the sub-agent must produce:
+        <<<SEARCH
+        <exact lines to find>
+        >>>REPLACE
+        <replacement lines>
+        >>>END
     """
     path        = args.get("path", "")
     instruction = args.get("instruction", "")
@@ -741,15 +749,26 @@ async def _execute_patch_file(args: dict, _retry: bool = False) -> str:
     if not SHELL_SERVER_URL:
         return "❌ patch_file: shell server not registered"
 
-    # Read the file via shell_server
     file_content, err = await _read_file_via_shell(path)
     if err:
         return err
 
     system = (
-        "You are a code patching assistant. "
-        "Produce ONLY a valid unified diff (output of `diff -u`) that applies the requested change. "
-        "No explanation, no markdown fences, no preamble. Raw diff only."
+        "You are a precise code editing assistant. "
+        "Given a file and an instruction, produce a SEARCH/REPLACE block. "
+        "Rules:\n"
+        "1. SEARCH must be an EXACT verbatim copy of the lines to replace — "
+        "   whitespace, indentation, and punctuation must match perfectly.\n"
+        "2. REPLACE is the new version of those lines.\n"
+        "3. Keep the block as small as possible — only include lines that change "
+        "   plus 1-2 lines of context to make it unique in the file.\n"
+        "4. Output ONLY the block. No explanation, no markdown, no preamble.\n\n"
+        "Format:\n"
+        "<<<SEARCH\n"
+        "<exact lines>\n"
+        ">>>REPLACE\n"
+        "<new lines>\n"
+        ">>>END"
     )
     user = (
         f"File: {path}\n\n"
@@ -761,7 +780,8 @@ async def _execute_patch_file(args: dict, _retry: bool = False) -> str:
     messages = [{"role": "system", "content": system}]
     messages += ctx_messages
     messages += [{"role": "user", "content": user}]
-    log.info(f"patch_file: generating diff for {path!r}, ctx={len(ctx_messages)}")
+    log.info(f"patch_file: generating search/replace for {path!r}, ctx={len(ctx_messages)}")
+
     try:
         async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(
@@ -773,40 +793,68 @@ async def _execute_patch_file(args: dict, _retry: bool = False) -> str:
                     "max_tokens": 4096,
                 },
             )
-            diff_text = resp.json()["choices"][0]["message"]["content"].strip()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         log.error(f"patch_file sub-agent error: {e}", exc_info=True)
-        return f"❌ patch_file: diff generation failed: {e}"
+        return f"❌ patch_file: generation failed: {e}"
 
-    # Strip accidental markdown fences
-    fence_m = re.search(r'(?m)^```[^\n]*\n(.*?)^```\s*$', diff_text, re.DOTALL)
-    if fence_m:
-        diff_text = fence_m.group(1)
+    # Parse SEARCH/REPLACE block — strip accidental fences first
+    raw = re.sub(r'(?m)^```[^\n]*\n', "", raw)
+    raw = re.sub(r'(?m)^```\s*$', "", raw)
+    raw = raw.strip()
 
-    log.info(f"patch_file: applying diff ({len(diff_text)} chars)")
+    m = re.search(
+        r'<<<SEARCH\n(.*?)\n>>>REPLACE\n(.*?)\n>>>END',
+        raw, re.DOTALL
+    )
+    if not m:
+        err_msg = f"❌ patch_file: could not parse SEARCH/REPLACE block. Got:\n{raw[:300]}"
+        if not _retry:
+            log.warning("patch_file: bad format, retrying with explicit feedback")
+            # Feed the failure back so the model can self-correct
+            args = dict(args)
+            args["_format_error"] = raw[:300]
+            return await _execute_patch_file(args, _retry=True)
+        return err_msg
+
+    search_text  = m.group(1)
+    replace_text = m.group(2)
+
+    if search_text not in file_content:
+        if not _retry:
+            log.warning("patch_file: SEARCH text not found in file, retrying")
+            args = dict(args)
+            args["_match_error"] = (
+                f"The SEARCH block you produced was not found verbatim in the file. "
+                f"Check indentation and whitespace. SEARCH was:\n{search_text[:200]}"
+            )
+            return await _execute_patch_file(args, _retry=True)
+        return (
+            f"❌ patch_file: SEARCH block not found in file after retry.\n"
+            f"SEARCH was:\n{search_text[:300]}"
+        )
+
+    new_content = file_content.replace(search_text, replace_text, 1)
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                f"{SHELL_SERVER_URL}/patch_file",
-                json={"path": path, "diff": diff_text},
+                f"{SHELL_SERVER_URL}/apply_patch",
+                json={"path": path, "new_content": new_content},
             )
             r = resp.json()
     except Exception as e:
-        return f"❌ patch_file: apply request failed: {e}"
+        return f"❌ patch_file: write failed: {e}"
 
-    if r.get("ok"):
-        result_diff = r.get("diff", "")
-        log.info(f"patch_file: success for {path!r}")
-        return (
-            f"Patch applied to `{path}`.\n\n"
-            f"**Resulting diff:**\n``````diff\n{result_diff}\n``````"
-        )
+    if not r.get("ok"):
+        return f"❌ patch_file: write failed: {r.get('error', 'unknown')}"
 
-    if not _retry:
-        log.warning(f"patch_file: first attempt failed ({r.get('error')}), retrying")
-        return await _execute_patch_file(args, _retry=True)
-
-    return f"❌ patch_file: apply failed after retry: {r.get('error', 'unknown')}"
+    diff_text = r.get("diff", "")
+    log.info(f"patch_file: applied search/replace to {path!r}")
+    return (
+        f"Patch applied to `{path}`.\n\n"
+        f"**Diff:**\n``````diff\n{diff_text}\n``````"
+    )
 
 
 # ── dot-command dispatcher ────────────────────────────────────────────────────

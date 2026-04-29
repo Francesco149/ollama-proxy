@@ -57,7 +57,11 @@ class RunTestRequest(BaseModel):
 
 class PatchFileRequest(BaseModel):
     path: str
-    diff: str   # unified diff produced by the patch sub-agent
+    diff: str   # unified diff (legacy endpoint, kept for compatibility)
+
+class ApplyPatchRequest(BaseModel):
+    path: str
+    new_content: str   # complete new file content after search/replace
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -192,6 +196,38 @@ async def patch_file(request: PatchFileRequest):
 
     finally:
         Path(diff_path).unlink(missing_ok=True)
+        backup.unlink(missing_ok=True)
+
+
+@app.post("/apply_patch")
+async def apply_patch(request: ApplyPatchRequest):
+    """
+    Write new_content to path and return a diff of the change.
+    Used by the search/replace patch_file implementation — the proxy does
+    the string replacement, we just write the result and produce the diff.
+    """
+    target = Path(request.path)
+    if not target.exists():
+        return {"ok": False, "error": f"File not found: {request.path}"}
+
+    backup = Path(f"/tmp/apply_patch_backup_{target.name}")
+    backup.write_bytes(target.read_bytes())
+    log.info(f"apply_patch: writing {request.path} ({len(request.new_content)} chars)")
+
+    try:
+        target.write_text(request.new_content, encoding="utf-8")
+        diff_result = await _run(f"diff -u {backup} {target}")
+        return {
+            "ok":   True,
+            "path": request.path,
+            "diff": diff_result["stdout"],
+        }
+    except Exception as e:
+        # Restore backup on failure
+        target.write_bytes(backup.read_bytes())
+        log.error(f"apply_patch failed, restored: {e}")
+        return {"ok": False, "error": str(e)}
+    finally:
         backup.unlink(missing_ok=True)
 
 
