@@ -4,11 +4,17 @@
 
 A personal, ad-hoc tool designed to bridge LLMs (via Ollama/llama.cpp) with a local shell environment.
 
+This readme is severely outdated and doesn't explain the current state of the project so have a screenshot for now:
+
+![](Screenshot_20260429_023155.png)
+
 The main feature is a custom agentic workflow in Open WebUI where the LLM can surgically explore and probe your code by running shell commands like grep in your project folder.
+
+It also features a running document plus aggressive context eviction.
 
 This keeps the context small and maintains very quick response times from the LLM as it methodically gathers information and navigates the codebase.
 
-I currently use this with gemma4 a4b `q3_k_m` and it's a very responsive and viable local AI coding workflow which wrote most of this code and spec files.
+I currently use this with gemma4 26B a4b apex mini quant and it's a very responsive and viable local AI coding workflow which wrote most of this code and spec files.
 
 ## Quick Start
 
@@ -22,50 +28,6 @@ I currently use this with gemma4 a4b `q3_k_m` and it's a very responsive and via
    - `export PROXY_URL=http://localhost:11434 && python shell_server.py`
    - You would run this in the root folder of your project, ideally sandboxed so it doesn't have access to anything else. **This can run arbitrary commands on your machine!**
 
-## Agentic Coding Workflow (Example)
-
-This is how a typical session looks when using the agentic skills:
-
-```text
-user: #code let's refactor the port logic. project folder is /opt/ai-lab/ollama-proxy
-agent: I'll need to find where the port is currently defined. Please run:
-`git -C /opt/ai-lab/ollama-proxy grep -r "port" .`
-user: .run
-agent:
-proxy.py:25:        proxy_port = server_cfg.get("proxy_port", 11434)
-shell_server.py:12:    log.error("[shell] PROXY_URL environment variable not set.")
-
-user: move the port into the config file
-agent: I need to see how the config is loaded. Please run:
-`cat config_loader.py`
-user: .run
-agent:
-import os
-...
-def _load_config() -> Dict[str, Any]:
-    config_path = os.environ.get("OLLAMA_PROXY_CONFIG", "config.toml")
-
-user: okay, update config_loader.py to use the absolute path
-agent: I'll update the default path in config_loader.py to /opt/ai-lab/ollama-proxy/config.toml.
-
-edit config_loader.py
-... update default path ...
-
-(user manually runs prompt on aider interactively)
-
-user: .diff
-agent:
-diff --git a/config_loader.py b/config_loader.py
-index 8c7414b..9eefa5c 100644
---- a/config_loader.py
-+++ b/config_loader.py
-@@ -22,7 +22,7 @@ def _load_config() -> Dict[str, Any]:
--    config_path = os.environ.get("OLLAMA_PROXY_CONFIG", "config.toml")
-+    config_path = os.environ.get("OLLAMA_PROXY_CONFIG", "/opt/ai-lab/ollama-proxy/config.toml")
-
-user: looks good?
-agent: Yes, that looks perfect. Refactor complete.
-```
 
 ## Skills & Commands
 
