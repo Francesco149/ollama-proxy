@@ -123,16 +123,16 @@ def _params_block(tool_name: str, args: dict) -> str:
         return _details(f"📦  git commit: {msg}", f"**Message:** {msg}")
 
     if tool_name == "search_code":
-        n = len([l for l in result.strip().split("\n") if l])
-        label = "search: " + str(n) + (" matches" if n != 1 else " match")
-        return _details(label, _fenced(result))
+        pat  = args.get("pattern", "")
+        path = args.get("path", "")
+        body = "**Pattern:** `" + pat + "`" + ("\n\n**Path:** `" + path + "`" if path else "")
+        return _details("search: " + pat[:80], body)
 
     if tool_name == "read_file":
-        truncated = "[truncated] " if result.startswith("[File truncated") else ""
-        return _details("read_file: " + truncated + _strip_preview(result), _fenced(result))
-        return _details(f"📄  {path.split('/')[-1]}", f"**Path:** `{path}`")
+        path = args.get("path", "")
+        return _details("read: " + path.split("/")[-1], "**Path:** `" + path + "`")
 
-    return _details(f"▶  {tool_name}", _fenced(json.dumps(args, indent=2)))
+    return _details("call: " + tool_name, _fenced(json.dumps(args, indent=2)))
 
 
 def _result_block(tool_name: str, args: dict, result: str) -> str:

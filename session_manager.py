@@ -241,13 +241,20 @@ class SessionManager:
         keep_turns: int = 8,
         token_budget: int = 12000,
     ) -> None:
-        """Run eviction pass on the stored context for this key."""
+        """Run eviction pass on the stored context for this key.
+
+        evict_old_turns replaces content in-place (same message count) so
+        we compare content, not length, to decide whether to save.
+        """
         if not self.has_clean_context(key):
             return
         before = self._store[key]["messages"]
         after = evict_old_turns(before, keep_turns=keep_turns, token_budget=token_budget)
-        if len(after) < len(before):
+        # Compare by content — eviction replaces role=tool content in-place,
+        # so len(after) == len(before) even after successful eviction.
+        if after is not before:
             self._store[key]["messages"] = after
+            log.debug(f"context {key}: evicted, now {len(after)} messages")
             self._save()
 
     def register_next(self, from_key: str, to_key: str) -> None:
