@@ -755,25 +755,41 @@ async def _execute_patch_file(args: dict, _retry: bool = False) -> str:
 
     system = (
         "You are a precise code editing assistant. "
-        "Given a file and an instruction, produce a SEARCH/REPLACE block. "
-        "Rules:\n"
-        "1. SEARCH must be an EXACT verbatim copy of the lines to replace — "
-        "   whitespace, indentation, and punctuation must match perfectly.\n"
-        "2. REPLACE is the new version of those lines.\n"
-        "3. Keep the block as small as possible — only include lines that change "
-        "   plus 1-2 lines of context to make it unique in the file.\n"
-        "4. Output ONLY the block. No explanation, no markdown, no preamble.\n\n"
-        "Format:\n"
+        "Given a file and an instruction, produce one or more SEARCH/REPLACE blocks.\n\n"
+        "RULES:\n"
+        "1. SEARCH must be EXACTLY verbatim from the file — copy-paste the lines directly. "
+        "   Every space, tab, comma, bracket, and character must match perfectly.\n"
+        "2. REPLACE is the complete new version of those lines.\n"
+        "3. Each block must be as small as possible — only the lines that change "
+        "   plus 1-2 surrounding lines to make the location unique.\n"
+        "4. For multi-part changes, produce multiple separate blocks in order.\n"
+        "5. NEVER include <<<SEARCH, >>>REPLACE, or >>>END markers inside a REPLACE block.\n"
+        "6. Output ONLY the blocks. No explanation, no markdown fences, no preamble.\n\n"
+        "FORMAT (repeat for each change):\n"
         "<<<SEARCH\n"
-        "<exact lines>\n"
+        "<exact lines copied verbatim from the file>\n"
         ">>>REPLACE\n"
         "<new lines>\n"
         ">>>END"
     )
+    format_error = args.get("_format_error", "")
+    match_error  = args.get("_match_error", "")
+    retry_note   = ""
+    if format_error:
+        retry_note = (
+            f"\n\nPREVIOUS ATTEMPT FAILED: your output could not be parsed as a "
+            f"SEARCH/REPLACE block. Output was:\n{format_error}\n"
+            f"Produce ONLY the block in the exact format specified."
+        )
+    elif match_error:
+        retry_note = (
+            f"\n\nPREVIOUS ATTEMPT FAILED: {match_error}\n"
+            f"Look at the file content carefully and copy the SEARCH text verbatim."
+        )
     user = (
         f"File: {path}\n\n"
         f"<file>\n{file_content}\n</file>\n\n"
-        f"Instruction: {instruction}"
+        f"Instruction: {instruction}{retry_note}"
     )
 
     ctx_messages = await _build_context_messages("patch_file")
@@ -798,43 +814,94 @@ async def _execute_patch_file(args: dict, _retry: bool = False) -> str:
         log.error(f"patch_file sub-agent error: {e}", exc_info=True)
         return f"❌ patch_file: generation failed: {e}"
 
-    # Parse SEARCH/REPLACE block — strip accidental fences first
+    # Strip accidental markdown fences
     raw = re.sub(r'(?m)^```[^\n]*\n', "", raw)
     raw = re.sub(r'(?m)^```\s*$', "", raw)
     raw = raw.strip()
 
-    m = re.search(
+    # Parse ALL SEARCH/REPLACE blocks — model may produce multiple for
+    # complex instructions. Each is applied sequentially to the file.
+    blocks = re.findall(
         r'<<<SEARCH\n(.*?)\n>>>REPLACE\n(.*?)\n>>>END',
         raw, re.DOTALL
     )
-    if not m:
+
+    if not blocks:
         err_msg = f"❌ patch_file: could not parse SEARCH/REPLACE block. Got:\n{raw[:300]}"
         if not _retry:
-            log.warning("patch_file: bad format, retrying with explicit feedback")
-            # Feed the failure back so the model can self-correct
+            log.warning("patch_file: bad format on first attempt, retrying")
             args = dict(args)
             args["_format_error"] = raw[:300]
             return await _execute_patch_file(args, _retry=True)
         return err_msg
 
-    search_text  = m.group(1)
-    replace_text = m.group(2)
+    log.info(f"patch_file: {len(blocks)} block(s) to apply")
 
-    if search_text not in file_content:
-        if not _retry:
-            log.warning("patch_file: SEARCH text not found in file, retrying")
-            args = dict(args)
-            args["_match_error"] = (
-                f"The SEARCH block you produced was not found verbatim in the file. "
-                f"Check indentation and whitespace. SEARCH was:\n{search_text[:200]}"
+    # Apply all blocks sequentially — work on a mutable copy
+    new_content = file_content
+    failed_blocks = []
+
+    for i, (search_text, replace_text) in enumerate(blocks):
+        if search_text in new_content:
+            new_content = new_content.replace(search_text, replace_text, 1)
+            log.debug(f"patch_file: block {i+1} applied")
+        else:
+            # Try a whitespace-normalised fuzzy match as a fallback —
+            # catches cases where the model reconstructed the SEARCH text
+            # with slightly wrong indentation or collapsed whitespace.
+            import difflib
+            # Split into lines and find the closest matching window
+            search_lines  = search_text.splitlines()
+            content_lines = new_content.splitlines()
+            best_ratio = 0.0
+            best_start = -1
+            n = len(search_lines)
+            for j in range(len(content_lines) - n + 1):
+                window = content_lines[j:j+n]
+                ratio  = difflib.SequenceMatcher(
+                    None,
+                    "\n".join(search_lines),
+                    "\n".join(window),
+                ).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start = j
+
+            FUZZY_THRESHOLD = 0.92
+            if best_ratio >= FUZZY_THRESHOLD and best_start >= 0:
+                actual_text = "\n".join(content_lines[best_start:best_start+n])
+                log.warning(
+                    f"patch_file: block {i+1} fuzzy-matched at {best_ratio:.2%} "
+                    f"(line {best_start+1}), applying"
+                )
+                new_content = new_content.replace(actual_text, replace_text, 1)
+            else:
+                log.warning(
+                    f"patch_file: block {i+1} not found "
+                    f"(best fuzzy={best_ratio:.2%}), skipping"
+                )
+                failed_blocks.append((i+1, search_text, best_ratio))
+
+    if failed_blocks and not _retry:
+        # Feed back the failed blocks so the model can regenerate them
+        feedback = []
+        for (idx, st, ratio) in failed_blocks:
+            feedback.append(
+                f"Block {idx} SEARCH text was not found in the file "
+                f"(best similarity {ratio:.0%}). "
+                f"Check that the SEARCH text is copied verbatim from the file. "
+                f"SEARCH was:\n{st[:300]}"
             )
-            return await _execute_patch_file(args, _retry=True)
-        return (
-            f"❌ patch_file: SEARCH block not found in file after retry.\n"
-            f"SEARCH was:\n{search_text[:300]}"
-        )
+        args = dict(args)
+        args["_match_error"] = "\n---\n".join(feedback)
+        log.warning(f"patch_file: {len(failed_blocks)} block(s) failed, retrying")
+        return await _execute_patch_file(args, _retry=True)
 
-    new_content = file_content.replace(search_text, replace_text, 1)
+    if new_content == file_content:
+        return (
+            f"❌ patch_file: no blocks could be applied after retry.\n"
+            + "\n".join(f"Block {i}: {st[:150]}" for i, st, _ in failed_blocks)
+        )
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
