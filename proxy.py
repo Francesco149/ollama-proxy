@@ -46,6 +46,7 @@ TOOL_CONTEXT_MAX_MESSAGES = tools_ctx_cfg.get("max_messages", 20)
 ctx_cfg = config.get("context", {})
 EVICTION_KEEP_TURNS = ctx_cfg.get("eviction_keep_turns", 8)
 EVICTION_TOKEN_BUDGET = ctx_cfg.get("token_budget", 12000)
+EVICTION_USER_MESSAGES = ctx_cfg.get("evict_user_messages", False)
 
 autorun_cfg = config.get("autorun", {})
 TOOL_SUPPRESSION_ENABLED = autorun_cfg.get("tool_suppression", True)
@@ -298,6 +299,7 @@ async def chat(request: Request):
                 next_key,
                 keep_turns=EVICTION_KEEP_TURNS,
                 token_budget=EVICTION_TOKEN_BUDGET,
+                evict_user_messages=EVICTION_USER_MESSAGES,
             )
             log.debug(
                 f"context {next_key}: persisted + evicted "

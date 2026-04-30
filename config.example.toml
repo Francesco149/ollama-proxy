@@ -50,10 +50,13 @@ run_test    = "none"
 max_messages = 20
 
 [context]
-# Eviction keeps the last N assistant+tool iteration pairs verbatim.
-# Older turns have their role=tool content replaced with summary lines.
+# Number of recent assistant+tool iteration pairs to keep verbatim.
+# Older turns are dropped entirely (findings should be in the Working Doc).
 eviction_keep_turns = 8
 
-# Estimated token budget for the message history (excl. system messages).
-# A second eviction pass runs if the first doesn't bring it under budget.
+# Also drop old user messages, keeping only the first (original task) and
+# last (most recent instruction). Off by default — enable if the model is
+# good at recording new tasks in the Working Document.
+evict_user_messages = false
+
 token_budget = 12000

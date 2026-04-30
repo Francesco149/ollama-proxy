@@ -82,13 +82,15 @@ def evict_old_turns(
     messages: list[dict],
     keep_turns: int = 8,
     token_budget: int = 12000,
+    evict_user_messages: bool = False,
 ) -> list[dict]:
     """
     Drop old messages to keep context lean.
 
-    Keeps: all system messages, all user messages, and the last
-    `keep_turns` assistant+tool pairs. Everything older is dropped.
-    The Working Document captures findings so dropped results lose nothing.
+    Always keeps: system messages, last `keep_turns` assistant+tool pairs.
+    User messages: kept by default; set evict_user_messages=True to also
+    drop old user turns (keeps only the first and last user message so the
+    model always sees the original task and the most recent instruction).
     """
     if not messages:
         return messages
@@ -102,12 +104,19 @@ def evict_old_turns(
         return messages  # not enough history to drop anything
 
     keep_from = assistant_indices[-keep_turns]
-    kept = rest[keep_from:]
+    kept_rest = rest[keep_from:]
 
-    result = system_msgs + user_msgs + kept
-    log.debug(
-        "eviction: %d -> %d messages (dropped %d old turns)",
-        len(messages), len(result), len(rest) - len(kept),
+    if evict_user_messages and len(user_msgs) > 2:
+        # Keep first (original task) and last (most recent instruction)
+        kept_user = [user_msgs[0], user_msgs[-1]]
+        log.debug("eviction: dropped %d user messages", len(user_msgs) - 2)
+    else:
+        kept_user = user_msgs
+
+    result = system_msgs + kept_user + kept_rest
+    log.info(
+        "eviction: %d -> %d messages (dropped %d assistant/tool turns)",
+        len(messages), len(result), len(rest) - len(kept_rest),
     )
     return result
 
@@ -200,12 +209,18 @@ class SessionManager:
         key: str,
         keep_turns: int = 8,
         token_budget: int = 12000,
+        evict_user_messages: bool = False,
     ) -> None:
         """Drop old turns from the stored context for this key."""
         if not self.has_clean_context(key):
             return
         before = self._store[key]["messages"]
-        after = evict_old_turns(before, keep_turns=keep_turns, token_budget=token_budget)
+        after = evict_old_turns(
+            before,
+            keep_turns=keep_turns,
+            token_budget=token_budget,
+            evict_user_messages=evict_user_messages,
+        )
         if len(after) < len(before):
             self._store[key]["messages"] = after
             log.info(f"context {key}: evicted {len(before)-len(after)} messages, {len(after)} remain")

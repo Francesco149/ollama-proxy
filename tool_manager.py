@@ -906,12 +906,18 @@ async def _execute_patch_file(args: dict, _retry: bool = False) -> str:
     raw = re.sub(r'(?m)^```\s*$', "", raw)
     raw = raw.strip()
 
-    # Parse ALL SEARCH/REPLACE blocks — model may produce multiple for
-    # complex instructions. Each is applied sequentially to the file.
-    blocks = re.findall(
-        r'<<<SEARCH\n(.*?)\n>>>REPLACE\n(.*?)\n>>>END',
-        raw, re.DOTALL
-    )
+    # Split on >>>END first, then parse each segment.
+    # This prevents the greedy (.*?) from swallowing a >>>END and merging
+    # two blocks into one, which caused markers to leak into REPLACE text.
+    blocks = []
+    for segment in raw.split(">>>END"):
+        segment = segment.strip()
+        if "<<<SEARCH" not in segment or ">>>REPLACE" not in segment:
+            continue
+        m = re.search(r'<<<SEARCH\n(.*?)\n>>>REPLACE\n(.*)', segment, re.DOTALL)
+        if m:
+            # Do NOT strip replace_text — it would remove leading indentation
+            blocks.append((m.group(1), m.group(2)))
 
     if not blocks:
         err_msg = f"❌ patch_file: could not parse SEARCH/REPLACE block. Got:\n{raw[:300]}"
