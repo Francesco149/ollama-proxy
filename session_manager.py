@@ -84,70 +84,30 @@ def evict_old_turns(
     token_budget: int = 12000,
 ) -> list[dict]:
     """
-    Compress message history to stay within budget.
+    Drop old messages to keep context lean.
 
-    Always keeps:
-      - All system messages (working doc lives here)
-      - The last `keep_turns` assistant+tool pairs verbatim
-
-    For older turns beyond the keep window:
-      - role=tool → "[Result evicted: <first line>]"
-      - role=user with <command-output> → "[Output evicted]"
-      - role=assistant prose → kept (the model's reasoning is still useful)
-
-    If still over token_budget after one pass, evicts one more window.
+    Keeps: all system messages, all user messages, and the last
+    `keep_turns` assistant+tool pairs. Everything older is dropped.
+    The Working Document captures findings so dropped results lose nothing.
     """
     if not messages:
         return messages
 
-    # Separate system messages (always kept at front)
     system_msgs = [m for m in messages if m.get("role") == "system"]
-    rest = [m for m in messages if m.get("role") != "system"]
+    user_msgs   = [m for m in messages if m.get("role") == "user"]
+    rest        = [m for m in messages if m.get("role") not in ("system", "user")]
 
-    # Count assistant turns as the reliable eviction signal.
-    # Token estimate is a rough budget check only.
     assistant_indices = [i for i, m in enumerate(rest) if m.get("role") == "assistant"]
-    enough_history = len(assistant_indices) > keep_turns
-    over_budget = _estimate_tokens(rest) > token_budget
-    if not enough_history and not over_budget:
-        return messages  # nothing to evict yet
-
     if len(assistant_indices) <= keep_turns:
-        return messages  # guard — shouldn't be reached but keep for safety
-    evict_before = assistant_indices[-keep_turns]
+        return messages  # not enough history to drop anything
 
-    evicted = []
-    for i, m in enumerate(rest):
-        if i >= evict_before:
-            evicted.append(m)
-            continue
+    keep_from = assistant_indices[-keep_turns]
+    kept = rest[keep_from:]
 
-        role = m.get("role", "")
-        content = m.get("content") or ""
-
-        if role == "tool":
-            preview = _first_line(str(content))
-            evicted.append({**m, "content": f"[Result evicted: {preview}]"})
-
-        elif role == "user" and "<command-output>" in str(content):
-            evicted.append({**m, "content": "[Output evicted]"})
-
-        else:
-            evicted.append(m)  # keep assistant prose and regular user turns
-
-    result = system_msgs + evicted
-
-    # Second pass if still over budget
-    if _estimate_tokens(result) > token_budget:
-        log.warning(
-            f"still over budget after eviction "
-            f"(~{_estimate_tokens(result)} tokens), evicting one more window"
-        )
-        result = evict_old_turns(result, keep_turns=max(2, keep_turns // 2), token_budget=token_budget)
-
+    result = system_msgs + user_msgs + kept
     log.debug(
-        f"eviction: {len(messages)} → {len(result)} messages, "
-        f"~{_estimate_tokens(result)} tokens"
+        "eviction: %d -> %d messages (dropped %d old turns)",
+        len(messages), len(result), len(rest) - len(kept),
     )
     return result
 
@@ -241,20 +201,14 @@ class SessionManager:
         keep_turns: int = 8,
         token_budget: int = 12000,
     ) -> None:
-        """Run eviction pass on the stored context for this key.
-
-        evict_old_turns replaces content in-place (same message count) so
-        we compare content, not length, to decide whether to save.
-        """
+        """Drop old turns from the stored context for this key."""
         if not self.has_clean_context(key):
             return
         before = self._store[key]["messages"]
         after = evict_old_turns(before, keep_turns=keep_turns, token_budget=token_budget)
-        # Compare by content — eviction replaces role=tool content in-place,
-        # so len(after) == len(before) even after successful eviction.
-        if after is not before:
+        if len(after) < len(before):
             self._store[key]["messages"] = after
-            log.debug(f"context {key}: evicted, now {len(after)} messages")
+            log.info(f"context {key}: evicted {len(before)-len(after)} messages, {len(after)} remain")
             self._save()
 
     def register_next(self, from_key: str, to_key: str) -> None:
