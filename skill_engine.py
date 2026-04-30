@@ -7,6 +7,41 @@ from config_loader import get_config
 
 log = logging.getLogger("skill-engine")
 
+GENERIC_DOC_PROTOCOL = """
+## Working Document Protocol
+
+You have a Working Document that persists across this entire conversation.
+Use it as your live memory — update it continuously, not just at the start.
+
+### Sections
+- **Goal** — what the user is ultimately trying to achieve
+- **Status** — current state: what's done, what's in progress, what's blocked
+- **Key Facts** — important constraints, decisions, values, or context the user has given
+- **Open Items** — things that need doing, clarifying, or following up
+
+### When to update — be proactive, not reactive
+
+Update the document when:
+- The user states a new goal or task → set **Goal**, add to **Open Items**
+- You complete something the user asked for → mark it done in **Status**, remove from **Open Items**
+- The user says something was wrong or asks for a correction → revert **Status**, re-add to **Open Items**
+- The user provides new information or a constraint → add to **Key Facts**
+- The user changes direction → update **Goal** and **Status** to reflect the new direction
+- The user confirms something is good → note it in **Status**
+
+### How to update
+
+Call `update_document` with the section name and its full new content.
+Replace the entire section — don't append. Keep entries concise (bullet points).
+
+```
+update_document: {"section": "Status", "content": "- Drafted intro paragraph — approved by user\n- Working on section 2"}
+```
+
+Do not wait for a reminder. If something changed, update the document immediately.
+"""
+
+
 class SkillEngine:
     def __init__(self, session_manager: SessionManager):
         self.session_manager = session_manager
@@ -89,16 +124,29 @@ class SkillEngine:
         self.session_manager.update_skills(session_id, combined_active)
         log.info(f"[skill-engine] active: {combined_active}")
 
-        if not combined_active:
-            return messages
+        # Build skill injection text
+        if combined_active:
+            blocks = [f"## Active Skill: {n}\n\n{self.skills[n]}" for n in combined_active if n in self.skills]
+            skill_text = (
+                "# Active workflow skills for this conversation:\n\n"
+                + "\n\n---\n\n".join(blocks)
+                + "\n\n---\n\nThese skills remain active for the entire conversation.\n\n"
+            )
+            # Only inject generic doc protocol if no active skill already covers update_document
+            skill_content_combined = " ".join(self.skills.get(n, "") for n in combined_active)
+            needs_generic_doc = "update_document" not in skill_content_combined
+        else:
+            skill_text = ""
+            needs_generic_doc = True
 
-        # Prepare injection
-        blocks = [f"## Active Skill: {n}\n\n{self.skills[n]}" for n in combined_active if n in self.skills]
-        injection = (
-            "# Active workflow skills for this conversation:\n\n"
-            + "\n\n---\n\n".join(blocks)
-            + "\n\n---\n\nThese skills remain active for the entire conversation.\n\n"
-        )
+        if needs_generic_doc:
+            doc_text = GENERIC_DOC_PROTOCOL
+        else:
+            doc_text = ""
+
+        injection = doc_text + skill_text
+        if not injection:
+            return messages
 
         new_messages = list(messages)
         for i, msg in enumerate(new_messages):
@@ -106,6 +154,6 @@ class SkillEngine:
                 new_messages[i] = dict(msg)
                 new_messages[i]["content"] = injection + msg["content"]
                 return new_messages
-        
+
         new_messages.insert(0, {"role": "system", "content": injection})
         return new_messages

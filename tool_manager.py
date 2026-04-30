@@ -229,25 +229,68 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "read_file",
+            "name": "grep_context",
             "description": (
-                "Read the contents of a file. For large files, only the first N characters "
-                "are returned with a warning — use search_code or spawn_agent to inspect "
-                "specific parts instead of reading huge files in full."
+                "Find a pattern in a file and show surrounding lines. "
+                "Use this when you know what you're looking for (a function name, a variable, "
+                "a class) and want to see it in context — like `grep -n -A -B`. "
+                "Much more surgical than reading the whole file. "
+                "Output is capped at max_lines; if truncated, narrow your pattern."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to the file to read.",
+                        "description": "Absolute path to the file.",
                     },
-                    "max_chars": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "String to search for (literal, not regex).",
+                    },
+                    "context_lines": {
                         "type": "integer",
-                        "description": "Max characters to return (default: 4000). Increase only if you need more context.",
+                        "description": "Lines of context before and after each match (default: 10).",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Max output lines before truncation warning (default: 60).",
                     },
                 },
-                "required": ["path"],
+                "required": ["path", "pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_lines",
+            "description": (
+                "Show a specific line range from a file. "
+                "Use after search_code or grep_context tells you a line number. "
+                "Output is capped at max_lines; use a narrower range if truncated."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the file.",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to show (1-indexed).",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to show (inclusive).",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Max lines before truncation warning (default: 80).",
+                    },
+                },
+                "required": ["path", "start_line", "end_line"],
             },
         },
     },
@@ -404,8 +447,11 @@ async def execute_tool(name: str, args: dict) -> str:
     if name == "search_code":
         return await _execute_search_code(args)
 
-    if name == "read_file":
-        return await _execute_read_file(args)
+    if name == "grep_context":
+        return await _execute_grep_context(args)
+
+    if name == "view_lines":
+        return await _execute_view_lines(args)
 
     return f"Unknown tool: {name}"
 
@@ -536,7 +582,8 @@ def validate_tool_args(name: str, args: dict) -> str | None:
         "update_document": ["section", "content"],
         "git_commit":      ["message"],
         "search_code":     ["pattern"],
-        "read_file":       ["path"],
+        "grep_context":    ["path", "pattern"],
+        "view_lines":      ["path", "start_line", "end_line"],
     }
     fields = required.get(name, [])
     missing = [f for f in fields if not args.get(f)]
@@ -1091,24 +1138,100 @@ async def _execute_search_code(args: dict) -> str:
         return f"❌ search_code: {e}"
 
 
-READ_FILE_MAX_CHARS = 4000
+GREP_CONTEXT_MAX_LINES = 60
+VIEW_LINES_MAX_LINES   = 80
 
-async def _execute_read_file(args: dict) -> str:
-    """Read a file, truncating large files with a warning."""
-    path      = args.get("path", "")
-    max_chars = int(args.get("max_chars", READ_FILE_MAX_CHARS))
+
+async def _execute_grep_context(args: dict) -> str:
+    """grep -n with surrounding context lines, capped at max_lines."""
+    path          = args.get("path", "")
+    pattern       = args.get("pattern", "")
+    context_lines = int(args.get("context_lines", 10))
+    max_lines     = int(args.get("max_lines", GREP_CONTEXT_MAX_LINES))
+
     if not SHELL_SERVER_URL:
-        return "❌ read_file: shell server not registered"
-    content, err = await _read_file_via_shell(path)
+        return "❌ grep_context: shell server not registered"
+
+    file_content, err = await _read_file_via_shell(path)
     if err:
         return err
-    if len(content) > max_chars:
-        warning = (
-            f"[File truncated: {path} is {len(content)} chars, showing first {max_chars}. "
-            "Use search_code to find specific symbols or spawn_agent to analyse a section.]"
+
+    lines = file_content.splitlines()
+    match_indices = [
+        i for i, line in enumerate(lines)
+        if pattern in line
+    ]
+
+    if not match_indices:
+        return f"No matches for {pattern!r} in {path}"
+
+    # Build output ranges (merged overlapping windows)
+    ranges = []
+    for idx in match_indices:
+        start = max(0, idx - context_lines)
+        end   = min(len(lines) - 1, idx + context_lines)
+        if ranges and start <= ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], end)
+        else:
+            ranges.append((start, end))
+
+    out_lines = []
+    for (s, e) in ranges:
+        if out_lines:
+            out_lines.append("...")
+        for i in range(s, e + 1):
+            marker = ">>>" if pattern in lines[i] else "   "
+            out_lines.append(f"{marker} {i+1:4d}: {lines[i]}")
+
+    total = len(out_lines)
+    truncated = total > max_lines
+    shown = out_lines[:max_lines]
+
+    result = "\n".join(shown)
+    if truncated:
+        result += (
+            f"\n\n[Truncated: {total} lines, showing first {max_lines}. "
+            f"Use view_lines with a specific range or narrow the pattern.]"
         )
-        return warning + "\n\n" + content[:max_chars]
-    return content
+    return result
+
+
+async def _execute_view_lines(args: dict) -> str:
+    """Return a specific line range from a file, capped at max_lines."""
+    path       = args.get("path", "")
+    start_line = int(args.get("start_line", 1))
+    end_line   = int(args.get("end_line", start_line))
+    max_lines  = int(args.get("max_lines", VIEW_LINES_MAX_LINES))
+
+    if not SHELL_SERVER_URL:
+        return "❌ view_lines: shell server not registered"
+
+    file_content, err = await _read_file_via_shell(path)
+    if err:
+        return err
+
+    lines = file_content.splitlines()
+    total_lines = len(lines)
+
+    start_line = max(1, start_line)
+    end_line   = min(total_lines, end_line)
+    requested  = end_line - start_line + 1
+
+    if requested > max_lines:
+        end_line = start_line + max_lines - 1
+        truncation_note = (
+            f"\n\n[Truncated: requested {requested} lines, showing first {max_lines} "
+            f"(lines {start_line}-{end_line} of {total_lines}). "
+            f"Use a narrower range.]"
+        )
+    else:
+        truncation_note = ""
+
+    out_lines = []
+    for i in range(start_line - 1, min(end_line, total_lines)):
+        out_lines.append(f"{i+1:4d}: {lines[i]}")
+
+    return "\n".join(out_lines) + truncation_note
 
 
 async def _get_model_name() -> str:

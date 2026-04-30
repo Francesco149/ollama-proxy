@@ -37,6 +37,7 @@ log = logging.getLogger("session-manager")
 # ── working document defaults ─────────────────────────────────────────────────
 
 _DEFAULT_DOC_SECTIONS = [
+    # Coding skill sections
     "Project",
     "Task",
     "Scope",
@@ -44,6 +45,11 @@ _DEFAULT_DOC_SECTIONS = [
     "Plan",
     "Decisions",
     "Open Questions",
+    # Generic protocol sections
+    "Goal",
+    "Status",
+    "Key Facts",
+    "Open Items",
 ]
 
 _EMPTY_DOC: dict[str, str] = {s: "" for s in _DEFAULT_DOC_SECTIONS}

@@ -128,9 +128,23 @@ def _params_block(tool_name: str, args: dict) -> str:
         body = "**Pattern:** `" + pat + "`" + ("\n\n**Path:** `" + path + "`" if path else "")
         return _details("search: " + pat[:80], body)
 
-    if tool_name == "read_file":
+    if tool_name == "grep_context":
+        pat  = args.get("pattern", "")
         path = args.get("path", "")
-        return _details("read: " + path.split("/")[-1], "**Path:** `" + path + "`")
+        ctx  = args.get("context_lines", 10)
+        return _details(
+            "grep: " + pat[:60] + "  in  " + path.split("/")[-1],
+            "**File:** `" + path + "`\n\n**Pattern:** `" + pat + "`  context=" + str(ctx),
+        )
+
+    if tool_name == "view_lines":
+        path  = args.get("path", "")
+        start = args.get("start_line", "?")
+        end   = args.get("end_line", "?")
+        return _details(
+            "view: " + path.split("/")[-1] + " L" + str(start) + "-" + str(end),
+            "**File:** `" + path + "`\n\n**Lines:** " + str(start) + " – " + str(end),
+        )
 
     return _details("call: " + tool_name, _fenced(json.dumps(args, indent=2)))
 
@@ -184,9 +198,20 @@ def _result_block(tool_name: str, args: dict, result: str) -> str:
         n = len([l for l in result.strip().split("\n") if l.strip()])
         return _details("search: " + str(n) + (" matches" if n != 1 else " match") + "  " + preview, _fenced(result))
 
-    if tool_name == "read_file":
-        truncated = "[truncated] " if result.startswith("[File truncated") else ""
-        return _details("read: " + truncated + preview, _fenced(result))
+    if tool_name == "grep_context":
+        trunc = " [truncated]" if "[Truncated:" in result else ""
+        pat = args.get("pattern", "")
+        return _details("grep: " + pat[:50] + trunc, _fenced(result))
+
+    if tool_name == "view_lines":
+        trunc = " [truncated]" if "[Truncated:" in result else ""
+        path  = args.get("path", "")
+        start = args.get("start_line", "?")
+        end   = args.get("end_line", "?")
+        return _details(
+            "view: " + path.split("/")[-1] + " L" + str(start) + "-" + str(end) + trunc,
+            _fenced(result),
+        )
 
     return _details("ok  " + preview, _fenced(result))
 
