@@ -148,35 +148,45 @@ async def clear_session(request: Request):
 
 @app.post("/api/embed")
 async def embeddings(request: Request):
-    log.info("embedding request received")
-    body_json = await request.json()
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    headers.pop("content-length", None)
-    headers.pop("Content-Length", None)
+    try:
+        body_json = await request.json()
+        headers = dict(request.headers)
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+        headers.pop("Content-Length", None)
+        headers["content-type"] = "application/json"
 
-    if "prompt" in body_json:
-        body_json["input"] = body_json.pop("prompt")
+        if "prompt" in body_json:
+            body_json["input"] = body_json.pop("prompt")
 
-    content = json.dumps(body_json)
+        # pass input as-is — llama.cpp handles both string and array natively
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{EMBEDDING_BASE}/embedding",
+                content=json.dumps(body_json),
+                headers=headers,
+            )
+            data = resp.json()
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{EMBEDDING_BASE}/embedding",
-            content=content,
-            headers=headers,
-        )
-        data = resp.json()
+        # normalize to Ollama shape: {"embeddings": [[vec], [vec], ...]}
+        if isinstance(data, list):
+            # batch response: [{"embedding": [...]}, ...]
+            vecs = []
+            for item in data:
+                emb = item.get("embedding", [])
+                vecs.append(emb[0] if emb and not isinstance(emb[0], float) else emb)
+        elif "embedding" in data:
+            # single string response: {"embedding": [...]}
+            emb = data["embedding"]
+            vecs = [emb[0] if emb and not isinstance(emb[0], float) else emb]
+        else:
+            vecs = []
 
-    if isinstance(data, list):
-        embeddings_out = [
-            item["embedding"] if isinstance(item["embedding"][0], float) else item["embedding"][0]
-            for item in data
-            if "embedding" in item
-        ]
-        return JSONResponse(content={"embeddings": embeddings_out}, status_code=resp.status_code)
+        return JSONResponse(content={"embeddings": vecs}, status_code=resp.status_code)
 
-    return JSONResponse(content=data, status_code=resp.status_code)
+    except Exception as e:
+        log.error("embed handler error: %s", e, exc_info=True)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 # ── chat ──────────────────────────────────────────────────────────────────────
 
