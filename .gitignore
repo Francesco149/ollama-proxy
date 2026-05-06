@@ -1,5 +1,6 @@
 .aider*
 config.toml
+.sandbox_build_stamp
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
